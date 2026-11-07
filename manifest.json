@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "cantcode.app-binder",
+  "name": "App Binder",
+  "version": "0.1.0",
+  "author": "cantcode",
+  "description": "Assign a shortcut and a desktop to any app: one key focuses it if running, launches it if not",
+  "kinds": [
+    "overlay"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "overlay": "AppBinder.qml"
+  }
+}

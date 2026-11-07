@@ -2,7 +2,7 @@
 
 One key per app. Press it and the app comes forward if it's running, or launches if it isn't.
 
-App Binder is an [Omarchy](https://omarchy.org) shell plugin for the macOS/Raycast habit of jumping straight to an app by keyboard: `Super+Ctrl+1` for the terminal, `Super+Ctrl+6` for the browser, `Super+Ctrl+M` for mail. It's not "go to desktop 6 and hope the browser is there". It means "I want the browser", wherever the browser is.
+App Binder is an [Omarchy](https://omarchy.org) shell plugin for the macOS/Raycast habit of jumping straight to an app by keyboard. You choose the keys. For example, you might use `Super+Ctrl+1` for your terminal or `Super+Ctrl+M` for mail. A shortcut doesn't mean "go to a desktop and hope the app is there". It means "I want that app", wherever it is.
 
 Assign shortcuts in a table of every installed app: click a row, press the combo, done.
 
@@ -59,8 +59,6 @@ To open App Binder from a script or your own keybinding, with Settings showing o
 omarchy-shell shell summon cantcode.app-binder '{"settings": true}'
 omarchy-shell shell summon cantcode.app-binder '{"filter": "discord"}'
 ```
-
-A shortcut must include Super, Ctrl or Alt, so plain typing can never be taken over. Suggested convention: `Super+Ctrl+<key>` for apps, and `Super+Ctrl+Shift+<key>` for a "personal" counterpart (e.g. work browser and personal browser).
 
 ## Settings
 

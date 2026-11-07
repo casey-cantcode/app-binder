@@ -29,7 +29,7 @@ Assign shortcuts in a table of every installed app: click a row, press the combo
 
 ## Requirements
 
-- Omarchy 4 ("Quattro"), which uses the Lua Hyprland config and the Quickshell-based Omarchy shell. Tested on Omarchy 4.0.0.
+- Omarchy 4 ("Quattro"), which uses the Lua Hyprland config and the Quickshell-based Omarchy shell. Tested on Omarchy 4.0.6.
 - Hyprland 0.56 or newer. Tested on 0.56.2.
 
 ## Install

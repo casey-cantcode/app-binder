@@ -3,13 +3,14 @@
   "id": "cantcode.app-binder",
   "name": "App Binder",
   "version": "0.1.0",
-  "author": "cantcode",
-  "description": "Assign a shortcut and a desktop to any app: one key focuses it if running, launches it if not",
+  "author": "casey-cantcode",
+  "description": "One key per app: focus it if running, launch it if not. Assign shortcuts and a desktop to any installed app from a table.",
   "kinds": [
     "overlay"
   ],
   "keepLoaded": true,
   "entryPoints": {
     "overlay": "AppBinder.qml"
-  }
+  },
+  "license": "MIT"
 }

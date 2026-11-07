@@ -11,8 +11,9 @@ import qs.Ui
 // the shortcut then focuses the app if it's running or launches it if not.
 //
 // Source of truth: ~/.config/omarchy/app-binder.json
-// Generated for Hyprland: ~/.config/hypr/app-binder-data.lua
-// (read by ~/.config/hypr/app-binder.lua, which creates the bindings)
+// Generated for Hyprland: ~/.config/omarchy/app-binder-data.lua, read by
+// hypr/app-binder.lua, which this plugin runs inside Hyprland (hyprctl eval)
+// at startup and after every config reload. No hyprland.lua edits needed.
 Item {
   id: root
 
@@ -23,7 +24,10 @@ Item {
   readonly property string pluginId: (manifest && manifest.id) || "cantcode.app-binder"
   readonly property string home: Quickshell.env("HOME")
   readonly property string configPath: home + "/.config/omarchy/app-binder.json"
-  readonly property string dataPath: home + "/.config/hypr/app-binder-data.lua"
+  readonly property string dataPath: home + "/.config/omarchy/app-binder-data.lua"
+  readonly property string legacyDataPath: home + "/.config/hypr/app-binder-data.lua"
+  // Hyprland side, run inside Hyprland with `hyprctl eval` (see applyBindings).
+  readonly property string runtimePath: decodeURIComponent(String(Qt.resolvedUrl("hypr/app-binder.lua")).replace(/^file:\/\//, ""))
   readonly property string settingsPath: home + "/.config/omarchy/app-binder-settings.jsonc"
 
   // ---------------------------------------------------------------- settings
@@ -149,6 +153,14 @@ Item {
   property var apps: ({})
   property var binds: []
   property var windowClasses: []
+  // desktop id -> { file, kind, location } from scan-apps.sh
+  property var appInfo: ({})
+  readonly property string scanScript: decodeURIComponent(String(Qt.resolvedUrl("scan-apps.sh")).replace(/^file:\/\//, ""))
+  readonly property var kindLabels: ({
+    native: "Native", flatpak: "Flatpak", webapp: "Web app", appimage: "AppImage",
+    terminal: "Terminal app", steam: "Steam game", heroic: "Heroic game",
+    broken: "Broken: program not found", nocommand: "No command"
+  })
   property var rows: []
   property string filterText: ""
   property int selectedIndex: 0
@@ -172,10 +184,12 @@ Item {
   readonly property int cornerRadius: Style.cornerRadius
   property string fontFamily: Style.font.menuFamily
   property int contentMargin: Style.spacing.panelPadding
-  property int rowHeight: Math.max(Style.space(40), Style.font.heading + Style.spacing.controlPaddingY * 2)
+  // Two lines per row: app name, then its type and location.
+  property int rowHeight: Math.max(Style.space(50), Style.font.heading + Style.font.caption + Style.spacing.controlPaddingY * 2 + Style.spacing.xs)
+  property int pillHeight: Math.max(Style.space(30), Style.font.body + Style.spacing.controlPaddingY * 2)
   // Mouse-wheel speed: rows moved per wheel notch.
   property real wheelRowsPerNotch: Math.max(0.25, Number(root.setting("scroll_rows_per_notch")))
-  property int iconSize: Math.round(rowHeight * 0.62)
+  property int iconSize: Math.round(rowHeight * 0.58)
   property int shortcutWidth: Style.space(210)
   property int desktopWidth: Style.space(84)
   property int matchWidth: Style.space(250)
@@ -196,17 +210,20 @@ Item {
     // can slip past the file watcher.
     settingsFile.reload()
     // Settings start collapsed on every open (snap, no animation), unless the
-    // payload {"settings": true} asks for them.
+    // payload {"settings": true} asks for them. {"filter": "..."} pre-fills
+    // the filter.
     var showSettings = false
     try {
       var payload = JSON.parse(payloadJson || "{}")
       showSettings = !!(payload && payload.settings === true)
+      if (payload && typeof payload.filter === "string") root.filterText = payload.filter
     } catch (e) {}
     root.animateSettings = false
     root.settingsOpen = showSettings
     Qt.callLater(function() { root.animateSettings = true })
     bindsProc.running = true
     clientsProc.running = true
+    scanProc.running = true
     root.rebuild()
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
@@ -269,6 +286,8 @@ Item {
       list = list.filter(function(r) {
         return r.name.toLowerCase().indexOf(q) !== -1 || r.id.toLowerCase().indexOf(q) !== -1
           || r.label.toLowerCase().indexOf(q) !== -1
+          || r.kindLabel.toLowerCase().indexOf(q) !== -1
+          || r.location.toLowerCase().indexOf(q) !== -1
       })
     }
     list.sort(function(a, b) {
@@ -300,7 +319,11 @@ Item {
       defaultMatch: fallbackMatch,
       desktop: Number(cfg.desktop || 0),
       desktopAuto: cfg.desktopAuto === true,
-      missing: missing
+      missing: missing,
+      kind: root.appInfo[id] ? root.appInfo[id].kind : "",
+      kindLabel: root.appInfo[id] ? (root.kindLabels[root.appInfo[id].kind] || root.appInfo[id].kind) : "",
+      location: root.appInfo[id] ? root.appInfo[id].location : "",
+      file: root.appInfo[id] ? root.appInfo[id].file : ""
     }
   }
 
@@ -397,10 +420,11 @@ Item {
       "set -e\n"
       + "printf '%s' \"$1\" > \"$3.tmp\" && mv \"$3.tmp\" \"$3\"\n"
       + "printf '%s' \"$2\" > \"$4.tmp\" && mv \"$4.tmp\" \"$4\"\n"
-      + "hyprctl reload >/dev/null\n"
-      + "sleep 0.4\n"
-      + "hyprctl configerrors\n",
-      "app-binder-save", json, root.buildLua(), root.configPath, root.dataPath]
+      + "rm -f \"$5\"\n"
+      // A full reload restores any default binding a removed shortcut had
+      // replaced; App Binder re-applies its own on the configreloaded event.
+      + "hyprctl reload >/dev/null\n",
+      "app-binder-save", json, root.buildLua(), root.configPath, root.dataPath, root.legacyDataPath]
     saveProc.running = true
   }
 
@@ -627,6 +651,18 @@ Item {
     keyCatcher.forceActiveFocus()
   }
 
+  // Display paths with ~ for the home folder (copying keeps the full path).
+  function tildePath(path) {
+    var p = String(path || "")
+    return root.home && p.indexOf(root.home + "/") === 0 ? "~" + p.slice(root.home.length) : p
+  }
+
+  function copyText(text) {
+    if (!text) return
+    Quickshell.execDetached(["wl-copy", "--", text])
+    root.setStatus("Copied " + text, false)
+  }
+
   function setStatus(text, isError) {
     root.status = text
     root.statusError = isError === true
@@ -666,12 +702,64 @@ Item {
     }
   }
 
+  // ------------------------------------------------ install shortcuts in Hyprland
+
+  // Run hypr/app-binder.lua inside Hyprland. Runtime bindings are wiped by
+  // every config reload, so this runs at startup and on each configreloaded.
+  function applyBindings() {
+    applyProc.running = false
+    applyProc.running = true
+  }
+
+  Process {
+    id: applyProc
+    command: ["hyprctl", "eval", "dofile([==[" + root.runtimePath + "]==])"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var out = String(text || "").trim()
+        if (out !== "" && out !== "ok") root.setStatus("Couldn't install shortcuts in Hyprland: " + out, true)
+        bindsProc.running = true
+      }
+    }
+  }
+
+  Connections {
+    target: Hyprland
+    function onRawEvent(event) {
+      if (event && event.name === "configreloaded") root.applyBindings()
+    }
+  }
+
+  Component.onCompleted: root.applyBindings()
+
   Process {
     id: bindsProc
     command: ["hyprctl", "binds"]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.binds = root.parseBinds(text)
+    }
+  }
+
+  // Classifies desktop entries (native / Flatpak / web app / ...) so
+  // look-alike apps can be told apart. See scan-apps.sh.
+  Process {
+    id: scanProc
+    command: ["bash", root.scanScript]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var next = ({})
+        var lines = String(text || "").split("\n")
+        for (var i = 0; i < lines.length; i++) {
+          var f = lines[i].split("\t")
+          if (f.length < 4 || !f[0]) continue
+          next[f[0]] = { file: f[1], kind: f[2], location: f[3] }
+        }
+        root.appInfo = next
+        if (root.opened) root.rebuild()
+      }
     }
   }
 
@@ -735,7 +823,7 @@ Item {
 
   Connections {
     target: DesktopEntries.applications
-    function onValuesChanged() { if (root.opened) root.rebuild() }
+    function onValuesChanged() { if (root.opened) { root.rebuild(); scanProc.running = true } }
   }
 
 
@@ -1221,18 +1309,48 @@ Item {
                   onStatusChanged: if (status === Image.Error)
                     source = Quickshell.iconPath("application-x-executable", true)
                 }
-                Text {
+                Column {
                   anchors.left: appIcon.right
                   anchors.leftMargin: Style.spacing.md
                   anchors.right: parent.right
+                  anchors.rightMargin: Style.spacing.md
                   anchors.verticalCenter: parent.verticalCenter
-                  textFormat: Text.PlainText
-                  text: rowItem.modelData.name + (rowItem.modelData.missing ? "  (not installed)" : "")
-                  color: rowItem.textColor
-                  opacity: rowItem.modelData.missing ? 0.5 : 1
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.heading
-                  elide: Text.ElideRight
+                  spacing: Style.spacing.xs
+
+                  Text {
+                    width: parent.width
+                    textFormat: Text.PlainText
+                    text: rowItem.modelData.name + (rowItem.modelData.missing ? "  (not installed)" : "")
+                    color: rowItem.textColor
+                    opacity: rowItem.modelData.missing ? 0.5 : 1
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.heading
+                    elide: Text.ElideRight
+                  }
+
+                  // Type · location. Click copies the location (e.g. to
+                  // uninstall a duplicate).
+                  Text {
+                    id: whereText
+                    width: Math.min(parent.width, implicitWidth)
+                    visible: rowItem.modelData.kindLabel !== ""
+                    textFormat: Text.PlainText
+                    text: rowItem.modelData.kindLabel + " · " + root.tildePath(rowItem.modelData.location)
+                    color: rowItem.textColor
+                    opacity: whereMouse.containsMouse ? 0.95 : (rowItem.modelData.kind === "broken" ? 0.8 : 0.5)
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    font.underline: whereMouse.containsMouse
+                    font.bold: rowItem.modelData.kind === "broken"
+                    elide: Text.ElideMiddle
+                    MouseArea {
+                      id: whereMouse
+                      anchors.fill: parent
+                      hoverEnabled: true
+                      cursorShape: Qt.PointingHandCursor
+                      onClicked: root.copyText(rowItem.modelData.location)
+                    }
+                  }
                 }
               }
 
@@ -1243,7 +1361,7 @@ Item {
                 Rectangle {
                   anchors.verticalCenter: parent.verticalCenter
                   width: parent.width - Style.spacing.md
-                  height: Math.round(root.rowHeight * 0.72)
+                  height: root.pillHeight
                   radius: root.cornerRadius
                   color: "transparent"
                   border.width: rowItem.isCapturing ? Math.max(1, Style.space(2)) : (rowItem.modelData.keys ? 1 : 0)
@@ -1273,7 +1391,7 @@ Item {
                 Rectangle {
                   anchors.verticalCenter: parent.verticalCenter
                   width: parent.width - Style.spacing.md
-                  height: Math.round(root.rowHeight * 0.72)
+                  height: root.pillHeight
                   radius: root.cornerRadius
                   color: "transparent"
                   border.width: 1
@@ -1328,7 +1446,7 @@ Item {
                   visible: rowItem.isEditing
                   anchors.verticalCenter: parent.verticalCenter
                   width: parent.width - Style.spacing.sm
-                  height: Math.round(root.rowHeight * 0.72)
+                  height: root.pillHeight
                   radius: root.cornerRadius
                   color: "transparent"
                   border.width: Math.max(1, Style.space(2))

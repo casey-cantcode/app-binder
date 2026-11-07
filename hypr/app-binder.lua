@@ -1,7 +1,10 @@
 -- App Binder runtime: per-app focus-or-launch shortcuts.
 --
 -- The App Binder plugin owns the shortcut table and writes it to
--- ~/.config/hypr/app-binder-data.lua, then reloads Hyprland.
+-- ~/.config/omarchy/app-binder-data.lua. The plugin runs this file inside
+-- Hyprland (`hyprctl eval`) when the shell starts and after every config
+-- reload, so nothing needs adding to hyprland.lua. Re-running it is safe: it
+-- first removes the bindings it made last time.
 -- This file turns each row into a binding:
 --   app running     -> switch to its desktop and focus its most
 --                      recently used window (never starts a second copy)
@@ -9,10 +12,6 @@
 --                      for "Any"), then launch it there
 --
 -- Open the App Binder window with SUPER+CTRL+ALT+SPACE.
---
--- Install: add this line to ~/.config/hypr/hyprland.lua, after
--- require("hypr.bindings"):
---   dofile(os.getenv("HOME") .. "/.config/omarchy/plugins/cantcode.app-binder/hypr/app-binder.lua")
 
 -- Optional multi-monitor hook: if ~/.config/hypr/linked-desktops.lua exists
 -- (a module with switch / focus_window / first_empty), App Binder uses it so
@@ -41,20 +40,33 @@ if not has_linked then
 end
 
 local HOME = os.getenv("HOME") or ""
-local DATA = HOME .. "/.config/hypr/app-binder-data.lua"
+local DATA = HOME .. "/.config/omarchy/app-binder-data.lua"
+local LEGACY_DATA = HOME .. "/.config/hypr/app-binder-data.lua" -- before 0.1.0
 local PLUGIN_ID = "cantcode.app-binder"
+local OPENER = "SUPER + CTRL + ALT + SPACE"
 
--- Opener for the App Binder window.
-hl.unbind("SUPER + CTRL + ALT + SPACE")
-o.bind("SUPER + CTRL + ALT + SPACE", "App Binder",
-  "omarchy-shell shell toggle " .. PLUGIN_ID .. " '{}'")
+-- Remove what the previous run bound (a config reload starts from scratch
+-- anyway; this covers repeat runs without a reload, e.g. a shell restart).
+local previous = rawget(_G, "__app_binder_bound") or {}
+for _, keys in ipairs(previous) do pcall(hl.unbind, keys) end
+local bound = {}
+
+-- Opener for the App Binder window. Only App Binder's own previous binding is
+-- removed (above): if you use this combo for something else, it's left alone
+-- and both fire.
+o.bind(OPENER, "App Binder", "omarchy-shell shell toggle " .. PLUGIN_ID .. " '{}'")
+table.insert(bound, OPENER)
 
 -- Empty submap used while the plugin records a shortcut, so Hyprland lets the
 -- pressed combo through to the plugin instead of firing its current binding.
--- The plugin always resets it; this bind is the manual escape hatch.
-hl.define_submap("appbinder", function()
-  hl.bind("SUPER + CTRL + ALT + SHIFT + Escape", hl.dsp.submap("reset"))
-end)
+-- The plugin always resets it; this bind is the manual escape hatch. Defined
+-- once per config load.
+if not rawget(_G, "__app_binder_submap") then
+  hl.define_submap("appbinder", function()
+    hl.bind("SUPER + CTRL + ALT + SHIFT + Escape", hl.dsp.submap("reset"))
+  end)
+  rawset(_G, "__app_binder_submap", true)
+end
 
 -- "zen" matches class zen exactly (case-insensitive); "*hey.com*" is a glob.
 local function matcher(match)
@@ -105,19 +117,31 @@ local function activate(app)
   hl.exec_cmd("uwsm-app -- gtk-launch " .. shell_quote(app.id .. ".desktop"))
 end
 
-local ok, apps = pcall(dofile, DATA)
+local function exists(path)
+  local f = io.open(path)
+  if f then f:close() end
+  return f ~= nil
+end
+
+local data_path = exists(DATA) and DATA or (exists(LEGACY_DATA) and LEGACY_DATA or nil)
+local ok, apps = true, {}
+if data_path then ok, apps = pcall(dofile, data_path) end
 if not ok then
-  o.notify("App Binder: could not load " .. DATA .. ": " .. tostring(apps))
+  o.notify("App Binder: could not load " .. data_path .. ": " .. tostring(apps))
   apps = {}
 end
 
 for _, app in ipairs(apps or {}) do
   if type(app) == "table" and app.keys and app.keys ~= "" and app.id then
     pcall(hl.unbind, app.keys)
-    local bound, err = pcall(o.bind, app.keys, "App Binder: " .. (app.name or app.id),
+    local done, err = pcall(o.bind, app.keys, "App Binder: " .. (app.name or app.id),
       function() activate(app) end)
-    if not bound then
+    if done then
+      table.insert(bound, app.keys)
+    else
       o.notify("App Binder: could not bind " .. app.keys .. ": " .. tostring(err))
     end
   end
 end
+
+rawset(_G, "__app_binder_bound", bound)

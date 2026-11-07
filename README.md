@@ -6,8 +6,7 @@ App Binder is an [Omarchy](https://omarchy.org) shell plugin for the macOS/Rayca
 
 Assign shortcuts in a table of every installed app: click a row, press the combo, done.
 
-<!-- Add a screenshot: save it as preview.png in the repo root. -->
-![App Binder](preview.png)
+![App Binder: your apps, their shortcuts and desktops](preview.png)
 
 ## What a shortcut does
 
@@ -17,6 +16,7 @@ Assign shortcuts in a table of every installed app: click a row, press the combo
 ## Features
 
 - **Table of every installed app**, using the same list as Omarchy's app launcher, with icons. Bound apps sort to the top. Type to filter.
+- **Tells look-alike apps apart.** Under each name: its type (Native, Flatpak, Web app, AppImage, Terminal app, Steam game, Heroic game) and where it lives, e.g. `Native · /usr/bin/discord` next to `Web app · ~/.local/share/applications/Discord.desktop`. Click it to copy the path. That's handy for removing a duplicate install. Entries whose program no longer exists are flagged **Broken**. You can also filter by type or path ("flatpak", "web app", "/opt").
 - **Press-to-record shortcuts.** Click a row (or press Enter), then press the combo. While it records, your other Hyprland shortcuts are briefly paused, so even a combo that's already in use reaches the recorder instead of firing.
 - **Conflict warnings.** If a combo is already bound, App Binder shows what it does now. Press Enter to take it over or Esc to pick another. A combo moved from another App Binder row is removed from that row.
 - **A desktop per app.** Choose `Any` (first empty desktop) or 1–10.
@@ -34,21 +34,11 @@ Assign shortcuts in a table of every installed app: click a row, press the combo
 
 ## Install
 
-1. Add the plugin:
+```bash
+omarchy plugin add https://github.com/casey-cantcode/app-binder --enable
+```
 
-   ```bash
-   omarchy plugin add https://github.com/casey-cantcode/app-binder --enable
-   ```
-
-2. Load App Binder's Hyprland side by adding this line to `~/.config/hypr/hyprland.lua`, **after** `require("hypr.bindings")`, so App Binder's shortcuts override your own bindings:
-
-   ```lua
-   dofile(os.getenv("HOME") .. "/.config/omarchy/plugins/cantcode.app-binder/hypr/app-binder.lua")
-   ```
-
-   Hyprland reloads on save. Check for errors with `hyprctl configerrors`.
-
-3. Open App Binder with **Super+Ctrl+Alt+Space**.
+That's all: no Hyprland config to edit. Open App Binder with **Super+Ctrl+Alt+Space**. If you already use that combo for something else, your binding is kept and both will fire. Rebind one of them.
 
 ## Usage
 
@@ -63,9 +53,18 @@ Assign shortcuts in a table of every installed app: click a row, press the combo
 | Cog | Shows or hides Settings |
 | Esc, Super+Ctrl+Alt+Space, or click outside | Closes App Binder |
 
+To open App Binder from a script or your own keybinding, with Settings showing or the list pre-filtered:
+
+```bash
+omarchy-shell shell summon cantcode.app-binder '{"settings": true}'
+omarchy-shell shell summon cantcode.app-binder '{"filter": "discord"}'
+```
+
 A shortcut must include Super, Ctrl or Alt, so plain typing can never be taken over. Suggested convention: `Super+Ctrl+<key>` for apps, and `Super+Ctrl+Shift+<key>` for a "personal" counterpart (e.g. work browser and personal browser).
 
 ## Settings
+
+![App Binder's Settings panel](screenshots/settings.png)
 
 Change these with the cog, or edit `~/.config/omarchy/app-binder-settings.jsonc` directly (JSON with `//` comments). Saved changes apply immediately. Delete the file to restore the defaults.
 
@@ -79,16 +78,31 @@ Change these with the cog, or edit `~/.config/omarchy/app-binder-settings.jsonc`
 | `auto_desktop_other_keys` | `true` | Any other shortcut picks the first unused desktop |
 | `close_on_click_outside` | `true` | Clicking outside closes App Binder. When `false`, other windows stay clickable while it's open |
 
+## Dependencies and what it touches
+
+Everything it needs ships with Omarchy 4: `hyprctl`, `uwsm-app`, `gtk-launch` (GTK 3), `omarchy-launch-editor` and `omarchy-shell`. No extra packages.
+
+App Binder writes only its own files:
+
+- `~/.config/omarchy/app-binder.json`, your shortcuts
+- `~/.config/omarchy/app-binder-settings.jsonc`, settings
+- `~/.config/omarchy/app-binder-data.lua`, generated for Hyprland
+
+It never edits `hyprland.lua` or any other config file. Its shortcuts are added to the running Hyprland with `hyprctl eval` (see How it works). After a change it runs `hyprctl reload`. While recording a shortcut it briefly switches Hyprland to an empty keybinding submap (see Troubleshooting). It only replaces an existing Hyprland binding when you confirm the conflict prompt.
+
 ## How it works
 
 | File | Role |
 |---|---|
 | `AppBinder.qml` | The window (an Omarchy shell overlay plugin) |
 | `hypr/app-binder.lua` | Hyprland side: turns each saved row into a binding with the focus-or-launch logic |
+| `scan-apps.sh` | Classifies each desktop entry (type and location) for the second line under app names. Read-only |
 | `~/.config/omarchy/app-binder.json` | Your shortcuts. App Binder writes this; it's the source of truth |
-| `~/.config/hypr/app-binder-data.lua` | Generated from the JSON for Hyprland to read. Don't edit by hand |
+| `~/.config/omarchy/app-binder-data.lua` | Generated from the JSON for Hyprland to read. Don't edit by hand |
 
-When you change something, App Binder writes both files and runs `hyprctl reload`. Shortcuts are ordinary Hyprland bindings (described as `App Binder: <app>`), so they work from login whether or not the window is open, and appear in Omarchy's keybindings list.
+App Binder loads with the Omarchy shell at login and runs `hypr/app-binder.lua` inside Hyprland with `hyprctl eval`. That registers your shortcuts as ordinary Hyprland bindings (described as `App Binder: <app>`), so they work whether or not the window is open, and appear in Omarchy's keybindings list.
+
+A Hyprland config reload clears bindings added this way, so App Binder listens for Hyprland's `configreloaded` event and adds them again. Running the script twice never duplicates anything: it removes the bindings it made last time first. When you change something in App Binder, it writes both files and runs `hyprctl reload`, which also restores any default binding a removed shortcut had replaced.
 
 Apps launch the same way Omarchy's launcher starts them: `uwsm-app -- gtk-launch <app>.desktop`.
 
@@ -106,6 +120,7 @@ By default a "desktop" is a plain Hyprland workspace. If your setup treats a des
 
 - **The shortcut launches a second copy instead of focusing.** The window class doesn't match. Open the app, click its Window class cell in App Binder, and pick the right class from the open-window chips. Web apps usually need a wildcard such as `*hey.com*`.
 - **Keyboard shortcuts stopped working while recording.** Recording pauses Hyprland's shortcuts, and they come back automatically after the recording timeout. To restore them immediately, press **Super+Ctrl+Alt+Shift+Esc**.
+- **Shortcuts missing after login or a crash.** They're installed by the Omarchy shell, which also runs your bar. Run `omarchy restart shell` and they're added again.
 - **Edits to `AppBinder.qml` don't show up.** App Binder stays loaded for the whole session, so it doesn't hot-reload. Run `omarchy restart shell`.
 
 ## Uninstall
@@ -114,8 +129,12 @@ By default a "desktop" is a plain Hyprland workspace. If your setup treats a des
 omarchy plugin remove cantcode.app-binder
 ```
 
-Then remove the `dofile(...)` line from `~/.config/hypr/hyprland.lua`. Optionally delete `~/.config/omarchy/app-binder.json`, `~/.config/omarchy/app-binder-settings.jsonc` and `~/.config/hypr/app-binder-data.lua`.
+Its shortcuts stay active until the next Hyprland config reload or login, then they're gone. Run `hyprctl reload` to drop them right away. Optionally delete `~/.config/omarchy/app-binder.json`, `~/.config/omarchy/app-binder-settings.jsonc` and `~/.config/omarchy/app-binder-data.lua`.
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md). App Binder follows [Semantic Versioning](https://semver.org).
 
 ## License
 
-<!-- Choose a license (e.g. MIT) and add a LICENSE file. -->
+[MIT](LICENSE) © Casey Sorrells

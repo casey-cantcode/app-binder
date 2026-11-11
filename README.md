@@ -23,7 +23,7 @@ Assign shortcuts in a table of every installed app: click a row, press the combo
   - A shortcut ending in a number key sets that desktop: `Super+Ctrl+4` puts the app on desktop 4.
   - A shortcut ending in any other key picks the lowest desktop no other app uses.
   - Desktops you choose by hand are kept when you re-record a shortcut.
-- **Window matching** by Hyprland window class. App Binder fills in a sensible default (the app's `StartupWMClass`, or its desktop-entry ID). You can edit it, use `*` wildcards (e.g. `*hey.com*` for a web app), or pick from the classes of currently open windows.
+- **Window matching** that mostly takes care of itself. The first time App Binder launches an app, it learns which window belongs to it, even for games run through Wine or Proton, and recognizes it exactly from then on. Underneath, a match is a Hyprland window class, optionally narrowed by window title. App Binder fills in a sensible default (the app's `StartupWMClass`, or its desktop-entry ID). You can edit it, use `*` wildcards (e.g. `*hey.com*` for a web app), or pick from the currently open windows. Games run through Proton often share the class `steam_app_default`, so for those add the title: `steam_app_default title:Battle.net`. The open-window picker does this for you.
 - **Settings panel** behind the cog: sliders and switches, plus a button to edit the settings file directly.
 - **Matches your Omarchy theme.** It uses Omarchy's own shell components (the same rows, sliders and switches as the built-in panels).
 
@@ -49,7 +49,7 @@ That's all: no Hyprland config to edit. Open App Binder with **Super+Ctrl+Alt+Sp
 | Esc while recording | Cancels |
 | Backspace while recording, or Del | Clears the app's shortcut |
 | Click the Desktop cell, or ←/→ | Cycles `Any`, 1–10. Right-click cycles backwards |
-| Click the Window class cell | Edits the match; open windows' classes appear as clickable chips |
+| Click the Window match cell | Edits the match; open windows appear as clickable chips |
 | Cog | Shows or hides Settings |
 | Esc, Super+Ctrl+Alt+Space, or click outside | Closes App Binder |
 
@@ -116,7 +116,7 @@ By default a "desktop" is a plain Hyprland workspace. If your setup treats a des
 
 ## Troubleshooting
 
-- **The shortcut launches a second copy instead of focusing.** The window class doesn't match. Open the app, click its Window class cell in App Binder, and pick the right class from the open-window chips. Web apps usually need a wildcard such as `*hey.com*`.
+- **The shortcut launches a second copy instead of focusing, or says it can't find the window.** The window match doesn't fit the app's window. Open the app, click its Window match cell in App Binder, and pick its window from the open-window chips. Web apps usually need a wildcard such as `*hey.com*`, and games run through Proton need their title, such as `steam_app_default title:Battle.net`.
 - **Keyboard shortcuts stopped working while recording.** Recording pauses Hyprland's shortcuts, and they come back automatically after the recording timeout. To restore them immediately, press **Super+Ctrl+Alt+Shift+Esc**.
 - **Shortcuts missing after login or a crash.** They're installed by the Omarchy shell, which also runs your bar. Run `omarchy restart shell` and they're added again.
 - **Edits to `AppBinder.qml` don't show up.** App Binder stays loaded for the whole session, so it doesn't hot-reload. Run `omarchy restart shell`.

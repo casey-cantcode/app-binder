@@ -153,6 +153,9 @@ Item {
   property var apps: ({})
   property var binds: []
   property var windowClasses: []
+  // Window classes that many unrelated apps share, so a class alone can't
+  // tell them apart.
+  readonly property var sharedClasses: ["steam_app_default"]
   // desktop id -> { file, kind, location } from scan-apps.sh
   property var appInfo: ({})
   readonly property string scanScript: decodeURIComponent(String(Qt.resolvedUrl("scan-apps.sh")).replace(/^file:\/\//, ""))
@@ -382,6 +385,7 @@ Item {
         var copy = JSON.parse(JSON.stringify(a))
         copy.keys = ""
         copy.label = ""
+        copy.replaces = []
         next[k] = copy
         cleared.push(a.name || k)
       } else {
@@ -407,6 +411,7 @@ Item {
       out += "  { id = " + root.luaString(ids[i])
         + ", name = " + root.luaString(a.name || ids[i])
         + ", keys = " + root.luaString(a.keys)
+        + ", replaces = { " + (a.replaces || []).map(root.luaString).join(", ") + " }"
         + ", match = " + root.luaString(a.match || ids[i])
         + ", desktop = " + (Number(a.desktop || 0) | 0) + " },\n"
     }
@@ -492,6 +497,7 @@ Item {
       out.push({
         mouse: b.flags.indexOf("m") !== -1 && /^mouse/i.test(keyPart),
         modmask: Number(b.modmask),
+        combo: root.comboFor(Number(b.modmask), keyPart),
         submap: String(b.submap || ""),
         keycode: code ? Number(code[1]) : Number(b.keycode || 0),
         key: code ? "" : keyPart,
@@ -503,7 +509,23 @@ Item {
     return out
   }
 
-  function conflictFor(mask, keycode, label) {
+  // Hyprland's spelling of a binding ("SUPER + CTRL + B"), rebuilt from its
+  // modmask because `hyprctl binds` lists some keys without their modifiers.
+  // This is the string hl.unbind needs to remove that exact binding.
+  function comboFor(mask, keyPart) {
+    var names = []
+    if (mask & 64) names.push("SUPER")
+    if (mask & 4) names.push("CTRL")
+    if (mask & 8) names.push("ALT")
+    if (mask & 1) names.push("SHIFT")
+    names.push(keyPart)
+    return names.join(" + ")
+  }
+
+  // Every non-App Binder binding on this combo. A binding can be registered
+  // by key name ("B") or by key code ("code:56"), so both are checked.
+  function conflictsFor(mask, keycode, label) {
+    var found = []
     for (var i = 0; i < root.binds.length; i++) {
       var b = root.binds[i]
       if (!b || b.mouse || b.submap !== "") continue
@@ -511,9 +533,55 @@ Item {
       if (b.modmask !== mask) continue
       var sameCode = b.keycode !== 0 && b.keycode === keycode
       var sameName = b.keycode === 0 && b.key.toUpperCase() === label.toUpperCase()
-      if (sameCode || sameName) return b.description || (b.dispatcher + " " + b.arg)
+      if (sameCode || sameName) found.push(b)
     }
-    return ""
+    return found
+  }
+
+  function keycodeOf(keys) {
+    var m = String(keys || "").match(/code:(\d+)$/)
+    return m ? Number(m[1]) : 0
+  }
+
+  function bindTitle(b) {
+    return b.description || (b.dispatcher + " " + b.arg)
+  }
+
+  function maskOf(keys) {
+    var mask = 0
+    var parts = String(keys || "").toUpperCase().split("+")
+    for (var i = 0; i < parts.length; i++) {
+      var p = parts[i].trim()
+      if (p === "SUPER") mask |= 64
+      else if (p === "CTRL") mask |= 4
+      else if (p === "ALT") mask |= 8
+      else if (p === "SHIFT") mask |= 1
+    }
+    return mask
+  }
+
+  // Shortcuts saved before 0.2.0 have no `replaces` list, so a binding they
+  // took over (e.g. Omarchy's Super+Ctrl+B Bluetooth) kept firing alongside
+  // them. Taking it over always required confirming, so record it now.
+  function migrateReplaces() {
+    var next = ({})
+    var changed = false
+    for (var k in root.apps) {
+      var a = root.apps[k]
+      if (a.keys && a.replaces === undefined) {
+        var copy = JSON.parse(JSON.stringify(a))
+        var keyName = String(a.label || "").split("+").pop()
+        var hits = root.conflictsFor(root.maskOf(a.keys), root.keycodeOf(a.keys), keyName)
+        copy.replaces = hits.map(function(b) { return b.combo })
+        next[k] = copy
+        changed = true
+      } else {
+        next[k] = a
+      }
+    }
+    if (!changed) return
+    root.apps = next
+    root.save()
   }
 
   function handleCaptureKey(event) {
@@ -540,7 +608,7 @@ Item {
       var id = root.captureId
       var row = root.rowById(id)
       root.endCapture()
-      root.setApp(id, { keys: "", label: "" })
+      root.setApp(id, { keys: "", label: "", replaces: [] })
       root.setStatus("Cleared the shortcut for " + (row ? row.name : id), false)
       return
     }
@@ -570,12 +638,15 @@ Item {
     var capture = {
       id: root.captureId,
       keys: names.join(" + ") + " + code:" + keycode,
-      label: labels.join("+") + "+" + keyName
+      label: labels.join("+") + "+" + keyName,
+      replaces: []
     }
-    var taken = root.conflictFor(mask, keycode, keyName)
-    if (taken !== "") {
+    var taken = root.conflictsFor(mask, keycode, keyName)
+    if (taken.length > 0) {
+      capture.replaces = taken.map(function(b) { return b.combo })
       root.pendingCapture = capture
-      root.setStatus(capture.label + " is currently “" + taken + "”.   Enter takes it over · Esc picks another", true)
+      root.setStatus(capture.label + " is currently “" + taken.map(root.bindTitle).join("”, “")
+        + "”.   Enter takes it over · Esc picks another", true)
       return
     }
     root.applyCapture(capture)
@@ -604,7 +675,7 @@ Item {
     var row = root.rowById(capture.id)
     var cleared = root.clearKeysElsewhere(capture.keys, capture.id)
     root.endCapture()
-    var patch = { keys: capture.keys, label: capture.label }
+    var patch = { keys: capture.keys, label: capture.label, replaces: capture.replaces }
     // Auto-pick the desktop unless it was chosen by hand: a number key means
     // that desktop; any other key means the lowest desktop no other app uses.
     var current = row ? row.desktop : 0
@@ -638,7 +709,7 @@ Item {
     root.editingMatchId = id
     clientsProc.running = true
     var row = root.rowById(id)
-    root.setStatus("Window class to look for. Exact match, or use * as a wildcard. Enter saves · Esc cancels", false)
+    root.setStatus("Window class to look for, optionally followed by title:<window title>. Exact match, or use * as a wildcard. Enter saves · Esc cancels", false)
   }
 
   function commitMatch(id, value) {
@@ -647,7 +718,7 @@ Item {
     if (v === "" && row) v = row.defaultMatch
     root.editingMatchId = ""
     root.setApp(id, { match: v })
-    root.setStatus((row ? row.name : id) + " matches windows of class “" + v + "”", false)
+    root.setStatus((row ? row.name : id) + " matches windows: “" + v + "”", false)
     keyCatcher.forceActiveFocus()
   }
 
@@ -738,7 +809,10 @@ Item {
     command: ["hyprctl", "binds"]
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root.binds = root.parseBinds(text)
+      onStreamFinished: {
+        root.binds = root.parseBinds(text)
+        root.migrateReplaces()
+      }
     }
   }
 
@@ -769,17 +843,29 @@ Item {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        var seen = ({})
-        var out = []
+        // One chip per class. A class that several different apps share
+        // (Proton gives games it has no ID for "steam_app_default") gets one
+        // chip per window instead, matching class and title together.
+        var titles = ({})
         try {
           var list = JSON.parse(text)
           for (var i = 0; i < list.length; i++) {
             var c = String(list[i].class || "")
-            if (!c || c === "org.quickshell" || seen[c]) continue
-            seen[c] = true
-            out.push(c)
+            if (!c || c === "org.quickshell") continue
+            if (!titles[c]) titles[c] = []
+            var t = String(list[i].title || "").trim()
+            if (t && titles[c].indexOf(t) === -1) titles[c].push(t)
           }
         } catch (e) {}
+        var out = []
+        for (var cls in titles) {
+          var shared = root.sharedClasses.indexOf(cls.toLowerCase()) !== -1 || titles[cls].length > 1
+          if (shared && titles[cls].length > 0) {
+            for (var j = 0; j < titles[cls].length; j++) out.push(cls + " title:" + titles[cls][j])
+          } else {
+            out.push(cls)
+          }
+        }
         out.sort()
         root.windowClasses = out
       }
@@ -1249,7 +1335,7 @@ Item {
           }
           Text { width: root.shortcutWidth; text: "Shortcut"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.body }
           Text { width: root.desktopWidth; text: "Desktop"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.body }
-          Text { width: root.matchWidth; text: "Window class"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.body }
+          Text { width: root.matchWidth; text: "Window match"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.body }
         }
 
         ListView {

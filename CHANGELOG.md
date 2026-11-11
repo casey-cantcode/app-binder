@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- App Binder learns each app's window the first time it launches the app, then recognizes it exactly from then on, including games run through Wine or Proton. Learned matches live in `~/.local/state/app-binder-learned.lua`. A window match you set by hand always wins.
+- Better recognition of apps App Binder hasn't launched yet. Steam games are matched by their Steam ID. Small differences between an app's name and its window (case, spaces, punctuation, a version number) are ignored, and an app can also be found by its window title.
+- Window matches can include a title, such as `steam_app_default title:Battle.net`, for games that share a window class. The open-window picker fills this in for you.
+
+### Changed
+
+- The "Window class" column is now "Window match", since it can include a title.
+
+### Fixed
+
+- Taking over a shortcut that Omarchy binds by key name, such as Super+Ctrl+B for Bluetooth, now actually replaces it. Before, both fired. Shortcuts you already took over are fixed automatically.
+- Switching to an app no longer moves the mouse cursor.
+- Pressing a shortcut again while its app is still starting no longer launches a second copy. For up to a minute, the shortcut takes you to the app's desktop and shows a "still starting" notice instead.
+- App Binder's notices, such as "could not bind", now appear.
+
 ## [0.1.0] - 2026-11-07
 
 First public release.

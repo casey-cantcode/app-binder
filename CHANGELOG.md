@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - A window match containing an invisible control character, which some game window titles have, no longer stops every App Binder shortcut from loading. App Binder also checks its shortcut file before saving, and keeps your working shortcuts if the new file wouldn't load.
+- A special file named like an app entry (such as a named pipe ending in `.desktop`) can no longer leave App Binder's app scan stuck, with no app types or locations shown. Only regular files are read, and a scan that runs too long is stopped.
 
 ## [0.2.0] - 2026-11-11
 

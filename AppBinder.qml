@@ -900,6 +900,9 @@ Item {
   Process {
     id: scanProc
     command: ["bash", root.scanScript]
+    // The script does all its file reading itself, so stopping it (here, or
+    // when the shell unloads App Binder) leaves nothing running behind it.
+    onRunningChanged: running ? scanDeadline.restart() : scanDeadline.stop()
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -914,6 +917,13 @@ Item {
         if (root.opened) root.rebuild()
       }
     }
+  }
+
+  // A scan normally takes well under a second; never let one run on.
+  Timer {
+    id: scanDeadline
+    interval: 10000
+    onTriggered: if (scanProc.running) scanProc.running = false
   }
 
   Process {

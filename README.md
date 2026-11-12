@@ -79,15 +79,15 @@ Change these with the cog, or edit `~/.config/omarchy/app-binder-settings.jsonc`
 
 ## Dependencies and what it touches
 
-Everything it needs ships with Omarchy 4: `hyprctl`, `uwsm-app`, `gtk-launch` (GTK 3), `omarchy-launch-editor` and `omarchy-shell`. No extra packages.
+Everything it needs ships with Omarchy 4: `hyprctl`, `uwsm-app`, `gtk-launch` (GTK 3), `omarchy-launch-tui`, `omarchy-launch-config-editor` and `omarchy-shell`. No extra packages.
 
 App Binder writes only its own files:
 
 - `~/.config/omarchy/app-binder.json`, your shortcuts
 - `~/.config/omarchy/app-binder-settings.jsonc`, settings
-- `~/.config/omarchy/app-binder-data.lua`, generated for Hyprland
+- `$XDG_RUNTIME_DIR/app-binder-bindings.txt` and `app-binder-pending.txt`, small working files for Hyprland, in your private runtime folder (cleared at logout)
 
-It never edits `hyprland.lua` or any other config file. Its shortcuts are added to the running Hyprland with `hyprctl eval` (see How it works). After a change it runs `hyprctl reload`. While recording a shortcut it briefly switches Hyprland to an empty keybinding submap (see Troubleshooting). It only replaces an existing Hyprland binding when you confirm the conflict prompt.
+It never edits `hyprland.lua` or any other config file. Its shortcuts are added to the running Hyprland with `hyprctl eval` (see How it works). It runs `hyprctl reload` only when you remove a shortcut that had taken over one of Hyprland's own bindings, so that binding comes back. While recording a shortcut it briefly switches Hyprland to an empty keybinding submap (see Troubleshooting). It only replaces an existing Hyprland binding when you confirm the conflict prompt.
 
 ## How it works
 
@@ -96,14 +96,23 @@ It never edits `hyprland.lua` or any other config file. Its shortcuts are added 
 | `AppBinder.qml` | The window (an Omarchy shell overlay plugin) |
 | `hypr/app-binder.lua` | Hyprland side: turns each saved row into a binding with the focus-or-launch logic |
 | `scan-apps.sh` | Classifies each desktop entry (type and location) for the second line under app names. Read-only |
+| `launch-info.sh` | Tells App Binder which launcher entry started a window's process, so it can learn the window. Read-only |
 | `~/.config/omarchy/app-binder.json` | Your shortcuts. App Binder writes this; it's the source of truth |
-| `~/.config/omarchy/app-binder-data.lua` | Generated from the JSON for Hyprland to read. Don't edit by hand |
+| `$XDG_RUNTIME_DIR/app-binder-bindings.txt` | Your shortcuts as plain data for Hyprland to read. Rebuilt from the JSON |
 
-App Binder loads with the Omarchy shell at login and runs `hypr/app-binder.lua` inside Hyprland with `hyprctl eval`. That registers your shortcuts as ordinary Hyprland bindings (described as `App Binder: <app>`), so they work whether or not the window is open, and appear in Omarchy's keybindings list.
+App Binder loads with the Omarchy shell at login and runs `hypr/app-binder.lua` inside Hyprland with `hyprctl eval`. That registers your shortcuts as ordinary Hyprland bindings (described as `App Binder: <app>` in `hyprctl binds`), so they work whether or not the window is open.
 
-A Hyprland config reload clears bindings added this way, so App Binder listens for Hyprland's `configreloaded` event and adds them again. Running the script twice never duplicates anything: it removes the bindings it made last time first. When you change something in App Binder, it writes both files and runs `hyprctl reload`, which also restores any default binding a removed shortcut had replaced.
+A Hyprland config reload clears bindings added this way, so App Binder listens for Hyprland's `configreloaded` event and adds them again. Running the script again never duplicates anything: it removes exactly the bindings it made last time, and never anyone else's on the same keys.
 
-Apps launch the same way Omarchy's launcher starts them: `uwsm-app -- gtk-launch <app>.desktop`.
+Apps launch the same way Omarchy's launcher starts them: terminal apps with `omarchy-launch-tui`, everything else with `uwsm-app -- gtk-launch <app>.desktop`.
+
+### Safety
+
+App Binder runs inside your desktop, so it's written to never be the thing that hangs it:
+
+- The code that runs inside Hyprland when you press a shortcut reads only two small files in your private runtime folder, parses them as plain data (it never runs them as code), and bounds everything it compares. Anything that could wait, such as reading other programs' files or process information, happens in the plugin or its helper scripts, which have deadlines.
+- Desktop entries, window titles and App Binder's own files are treated as untrusted: only regular files are read, every read and every value has a size limit, special files (such as named pipes) are skipped, and malformed entries are ignored rather than trusted.
+- If `app-binder.json` can't be read, App Binder won't save over it, so a damaged file never costs you your shortcuts.
 
 ### Multi-monitor desktops (optional)
 
@@ -128,7 +137,7 @@ By default a "desktop" is a plain Hyprland workspace. If your setup treats a des
 omarchy plugin remove cantcode.app-binder
 ```
 
-Its shortcuts stay active until the next Hyprland config reload or login, then they're gone. Run `hyprctl reload` to drop them right away. Optionally delete `~/.config/omarchy/app-binder.json`, `~/.config/omarchy/app-binder-settings.jsonc` and `~/.config/omarchy/app-binder-data.lua`.
+Its shortcuts stay active until the next Hyprland config reload or login, then they're gone. Run `hyprctl reload` to drop them right away. Optionally delete `~/.config/omarchy/app-binder.json` and `~/.config/omarchy/app-binder-settings.jsonc`. The working files in `$XDG_RUNTIME_DIR` disappear at logout.
 
 ## Changelog
 

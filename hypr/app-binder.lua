@@ -1,112 +1,151 @@
 -- App Binder runtime: per-app focus-or-launch shortcuts.
 --
--- The App Binder plugin owns the shortcut table and writes it to
--- ~/.config/omarchy/app-binder-data.lua. The plugin runs this file inside
--- Hyprland (`hyprctl eval`) when the shell starts and after every config
--- reload, so nothing needs adding to hyprland.lua. Re-running it is safe: it
--- first removes the bindings it made last time.
--- This file turns each row into a binding:
+-- The App Binder plugin runs this file inside Hyprland (`hyprctl eval`) when
+-- the shell starts, after every config reload, and whenever the shortcuts
+-- change, so nothing needs adding to hyprland.lua. Re-running it is safe.
+-- Each row of the plugin's table becomes a binding:
 --   app focused     -> go back to the window you were on before
---   app running     -> switch to its desktop and focus its most
---                      recently used window (never starts a second copy)
---   app not running -> switch to the row's desktop (or the first empty one
---                      for "Any"), then launch it there
+--   app running     -> switch to its desktop and focus its most recently
+--                      used window (never starts a second copy)
+--   app not running -> switch to the row's desktop (or the first empty one),
+--                      then launch it there
 --
--- Open the App Binder window with SUPER+CTRL+ALT+SPACE.
+-- This code runs on Hyprland's own thread, so it never waits on anything:
+-- it reads only two small files in $XDG_RUNTIME_DIR (tmpfs, private to you),
+-- parses them as plain data (never runs them as code), bounds every input,
+-- and leaves all work that could block (scanning apps, learning which window
+-- belongs to which app) to the plugin, outside Hyprland.
 
--- Optional multi-monitor hook: if ~/.config/hypr/linked-desktops.lua exists
--- (a module with switch / focus_window / first_empty), App Binder uses it so
--- a "desktop" can span several monitors. Otherwise it switches plain
--- Hyprland workspaces.
-local has_linked, linked = pcall(require, "hypr.linked-desktops")
-if not has_linked then
-  linked = {
-    switch = function(n)
-      hl.dispatch(hl.dsp.focus({ workspace = tostring(n) }))
-    end,
-    focus_window = function(win)
-      hl.dispatch(hl.dsp.focus({ window = "address:" .. win.address }))
-    end,
-    first_empty = function()
-      local used = {}
-      for _, w in ipairs(hl.get_windows()) do
-        if w.workspace and w.workspace.id then used[w.workspace.id] = true end
-      end
-      for n = 1, 10 do
-        if not used[n] then return n end
-      end
-      return nil
-    end,
-  }
-end
-
-local HOME = os.getenv("HOME") or ""
-local DATA = HOME .. "/.config/omarchy/app-binder-data.lua"
-local LEGACY_DATA = HOME .. "/.config/hypr/app-binder-data.lua" -- before 0.1.0
+local RUNTIME = os.getenv("XDG_RUNTIME_DIR")
+local BINDINGS = RUNTIME and RUNTIME .. "/app-binder-bindings.txt" or nil
+local PENDING = RUNTIME and RUNTIME .. "/app-binder-pending.txt" or nil
 local PLUGIN_ID = "cantcode.app-binder"
 local OPENER = "SUPER + CTRL + ALT + SPACE"
 
--- Remove what the previous run bound (a config reload starts from scratch
--- anyway; this covers repeat runs without a reload, e.g. a shell restart).
-local previous = rawget(_G, "__app_binder_bound") or {}
-for _, keys in ipairs(previous) do pcall(hl.unbind, keys) end
-local bound = {}
-
--- Opener for the App Binder window. Only App Binder's own previous binding is
--- removed (above): if you use this combo for something else, it's left alone
--- and both fire.
-o.bind(OPENER, "App Binder", "omarchy-shell shell toggle " .. PLUGIN_ID .. " '{}'")
-table.insert(bound, OPENER)
-
--- Empty submap used while the plugin records a shortcut, so Hyprland lets the
--- pressed combo through to the plugin instead of firing its current binding.
--- The plugin always resets it; this bind is the manual escape hatch. Defined
--- once per config load.
-if not rawget(_G, "__app_binder_submap") then
-  hl.define_submap("appbinder", function()
-    hl.bind("SUPER + CTRL + ALT + SHIFT + Escape", hl.dsp.submap("reset"))
-  end)
-  rawset(_G, "__app_binder_submap", true)
-end
+local MAX_FILE = 4 * 1024 * 1024 -- bytes read from the bindings file
+local MAX_ROWS = 1000
+local MAX_TEXT = 512             -- bytes of a window class or title compared
+local LAUNCH_GRACE = 60          -- seconds a launch counts as still starting
 
 local function notify(message)
   hl.exec_cmd(o.notify(message)) -- o.notify only builds the command
 end
 
--- "zen" matches class zen exactly (case-insensitive); "*hey.com*" is a glob.
-local function pattern_test(match)
-  local m = string.lower(match or "")
-  if m == "" then return nil end
-  if m:find("*", 1, true) then
-    local escaped = (m:gsub("[%^%$%(%)%%%.%[%]%+%-%?]", "%%%0"))
-    local pattern = "^" .. (escaped:gsub("%*", ".*")) .. "$"
-    return function(s) return s ~= nil and string.lower(s):find(pattern) ~= nil end
-  end
-  return function(s) return s ~= nil and string.lower(s) == m end
+-- Optional multi-monitor hook: if ~/.config/hypr/linked-desktops.lua exists
+-- (a module with switch / focus_window / first_empty), a "desktop" can span
+-- several monitors. Otherwise App Binder switches plain workspaces.
+local has_linked, linked = pcall(require, "hypr.linked-desktops")
+if not has_linked then
+  linked = {
+    switch = function(n) hl.dispatch(hl.dsp.focus({ workspace = tostring(n) })) end,
+    focus_window = function(win) hl.dispatch(hl.dsp.focus({ window = "address:" .. win.address })) end,
+    first_empty = function()
+      local used = {}
+      for _, w in ipairs(hl.get_windows()) do
+        if w.workspace and w.workspace.id then used[w.workspace.id] = true end
+      end
+      for n = 1, 10 do if not used[n] then return n end end
+      return nil
+    end,
+  }
 end
 
--- A match is a window class, optionally followed by "title:<title>":
---   "zen"                                class only
---   "steam_app_default title:Battle.net" class and title (for runtimes such as
---                                        Proton that give many games one class)
---   "title:World of Warcraft"            title only
--- Both parts accept * wildcards.
+-- ------------------------------------------------------------ plain data
+-- Fields are percent-encoded (like a URL) and prefixed with "=", so a field
+-- never contains a space or newline and an empty field is just "=". A list
+-- is its items' fields joined by commas ("=a,=,=b" is a, "", b).
+
+local function decode(token)
+  if type(token) ~= "string" or token:sub(1, 1) ~= "=" then return nil end
+  return (token:sub(2):gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end))
+end
+
+local function decode_list(token)
+  if token == "=" then return {} end -- the empty list
+  if type(token) ~= "string" or token:sub(1, 1) ~= "=" then return nil end
+  local out = {}
+  for item in (token .. ","):gmatch("([^,]*),") do
+    local v = decode(item)
+    if not v then return nil end
+    out[#out + 1] = v
+  end
+  return out
+end
+
+local function encode(s)
+  return "=" .. tostring(s):gsub("[^%w%-%._~]", function(c) return string.format("%%%02X", c:byte()) end)
+end
+
+local function read_file(path, limit)
+  if not path then return nil end
+  local f = io.open(path, "rb")
+  if not f then return nil end
+  local text = f:read(limit)
+  f:close()
+  return text
+end
+
+local function tokens(line)
+  local out = {}
+  for t in line:gmatch("%S+") do out[#out + 1] = t end
+  return out
+end
+
+-- -------------------------------------------------------------- matching
+
+local function lower_capped(s)
+  return type(s) == "string" and string.lower(s:sub(1, MAX_TEXT)) or nil
+end
+
+-- A glob test for one part of a match. "*" matches anything; there are no
+-- other special characters. Linear time: pieces between stars are found left
+-- to right with plain search and never backtrack (Lua patterns could take
+-- minutes on a hostile window title, and Hyprland's Lua timeout can't stop
+-- them).
+local function glob(pattern)
+  local pat = string.lower(pattern)
+  if pat == "" then return nil end
+  if not pat:find("*", 1, true) then return function(s) return s == pat end end
+  local parts, start = {}, 1
+  while true do
+    local i = pat:find("*", start, true)
+    if not i then parts[#parts + 1] = pat:sub(start); break end
+    parts[#parts + 1] = pat:sub(start, i - 1)
+    start = i + 1
+  end
+  local first, last = parts[1], parts[#parts]
+  return function(s)
+    if not s or #s < #first + #last then return false end
+    if s:sub(1, #first) ~= first then return false end
+    if #last > 0 and s:sub(-#last) ~= last then return false end
+    local pos, limit = #first + 1, #s - #last
+    for i = 2, #parts - 1 do
+      local piece = parts[i]
+      if #piece > 0 then
+        local a, b = s:find(piece, pos, true)
+        if not a or b > limit then return false end
+        pos = b + 1
+      end
+    end
+    return true
+  end
+end
+
+-- A match is a window class, optionally followed by "title:<title>", e.g.
+-- "zen", "steam_app_default title:Battle.net" or "title:World of Warcraft".
 local function matcher(match)
   local m = match or ""
   local class_part, title_part = m, nil
   local at = m:find("title:", 1, true)
-  if at then
-    class_part = m:sub(1, at - 1)
-    title_part = m:sub(at + 6)
-  end
-  class_part = class_part:match("^%s*(.-)%s*$")
-  title_part = title_part and title_part:match("^%s*(.-)%s*$")
-  local class_test = pattern_test(class_part)
-  local title_test = title_part and pattern_test(title_part)
+  if at then class_part, title_part = m:sub(1, at - 1), m:sub(at + 6) end
+  local class_test = glob(class_part:match("^%s*(.-)%s*$"))
+  local title_test = title_part and glob(title_part:match("^%s*(.-)%s*$"))
   if not class_test and not title_test then return function() return false end end
   return function(w)
-    if class_test and not (class_test(w.class) or class_test(w.initial_class)) then return false end
-    if title_test and not title_test(w.title) then return false end
+    if class_test and not (class_test(lower_capped(w.class)) or class_test(lower_capped(w.initial_class))) then
+      return false
+    end
+    if title_test and not title_test((lower_capped(w.title) or ""):match("^%s*(.-)%s*$")) then return false end
     return true
   end
 end
@@ -124,233 +163,47 @@ local function best_window(test)
   return best
 end
 
--- Folders that hold launcher entries, in the order launchers search them:
--- the user's applications folder first, then the system ones.
-local function desktop_dirs()
-  local home = os.getenv("HOME") or ""
-  local dirs = { (os.getenv("XDG_DATA_HOME") or (home .. "/.local/share")) .. "/applications" }
-  for dir in string.gmatch(os.getenv("XDG_DATA_DIRS") or "/usr/local/share:/usr/share", "[^:]+") do
-    table.insert(dirs, dir .. "/applications")
-  end
-  return dirs
-end
-
--- True if a launcher entry with this ID exists.
-local function has_entry(id)
-  if not id or id == "" then return false end
-  for _, dir in ipairs(desktop_dirs()) do
-    local f = io.open(dir .. "/" .. id .. ".desktop")
-    if f then f:close(); return true end
-  end
-  return false
-end
-
--- The Exec line of an app's launcher entry.
-local function desktop_exec(id)
-  for _, dir in ipairs(desktop_dirs()) do
-    local f = io.open(dir .. "/" .. id .. ".desktop")
-    if f then
-      local in_entry, exec = false, nil
-      for line in f:lines() do
-        if line:match("^%[") then in_entry = (line == "[Desktop Entry]") end
-        if in_entry and not exec then exec = line:match("^Exec=(.*)$") end
-      end
-      f:close()
-      return exec
-    end
-  end
-  return nil
-end
-
-local steam_ids = {}
-local function steam_id(app)
-  if steam_ids[app.id] == nil then
-    local exec = desktop_exec(app.id) or ""
-    steam_ids[app.id] = exec:match("steam://rungameid/(%d+)") or false
-  end
-  return steam_ids[app.id] or nil
-end
-
--- Lowercase letters and digits only, so "Vintage Story", "vintagestory" and
--- "Vintage-Story" compare equal.
+-- Lowercase letters and digits only, so "Vintage Story" and "vintagestory"
+-- compare equal. The plugin sends each app's names already squashed.
 local function squash(s)
-  return (string.lower(s or ""):gsub("[^%w]", ""))
+  return type(s) == "string" and (string.lower(s:sub(1, MAX_TEXT)):gsub("[^%w]", "")) or ""
 end
 
--- Names that identify an app, squashed: its launcher ID, its name, and its
--- name without a trailing version ("Vintage Story 1.21.0" -> "vintagestory").
-local function app_keys(app)
-  local keys = {}
-  local function add(s)
-    local k = squash(s)
-    if k ~= "" then keys[k] = true end
-  end
-  add(app.id)
-  add(app.name)
-  add((app.name or ""):gsub("%s+v?%d[%w%.%-]*$", ""))
-  return keys
-end
-
--- ------------------------------------------------------- learned windows
---
--- Linux has no reliable link from a window to the launcher entry that
--- started it, so instead of guessing every time, App Binder learns it once.
--- When it launches an app, the standard launcher library records which
--- launcher entry started it (GIO_LAUNCHED_DESKTOP_FILE) in the app's
--- environment, and every process the app starts inherits that. The first
--- window whose process carries this app's record, and started after the
--- launch, is the app. App Binder saves an exact match from that window and
--- uses it from then on.
---
--- The record is inherited, so it can be stale: a launcher that was already
--- running (Steam, Heroic) passes on whatever started it, and so does a
--- terminal. That's why it's only trusted for processes newer than the launch,
--- and never for a window that is itself another launcher entry's app.
-
-local STATE_DIR = os.getenv("XDG_STATE_HOME") or ((os.getenv("HOME") or "") .. "/.local/state")
-local LEARNED = STATE_DIR .. "/app-binder-learned.lua"
-
--- Window classes that many unrelated apps share, so they need the title too.
-local SHARED_CLASSES = { steam_app_default = true }
-
-local function load_learned()
-  local ok, t = pcall(dofile, LEARNED)
-  return (ok and type(t) == "table") and t or {}
-end
-
-local function save_learned(t)
-  local f = io.open(LEARNED, "w")
-  if not f then return end
-  f:write("-- Window matches App Binder learned by watching apps it launched.\n")
-  f:write("-- Safe to delete: App Binder learns them again.\n")
-  f:write("return {\n")
-  for id, l in pairs(t) do
-    f:write(string.format("  [%q] = { match = %q, under = %q },\n", id, l.match or "", l.under or ""))
-  end
-  f:write("}\n")
-  f:close()
-end
-
--- The launcher entry ID recorded in a process's environment, or nil.
-local function launch_record(pid)
-  if type(pid) ~= "number" or pid <= 0 then return nil end
-  local f = io.open("/proc/" .. pid .. "/environ", "rb")
-  if not f then return nil end
-  local env = f:read("a") or ""
-  f:close()
-  local path = env:match("%zGIO_LAUNCHED_DESKTOP_FILE=([^%z]+)") or env:match("^GIO_LAUNCHED_DESKTOP_FILE=([^%z]+)")
-  return path and path:match("([^/]+)%.desktop$") or nil
-end
-
--- When a process started, in seconds since the epoch, or nil.
-local boot_time
-local function process_start(pid)
-  if type(pid) ~= "number" or pid <= 0 then return nil end
-  if not boot_time then
-    local f = io.open("/proc/stat")
-    if not f then return nil end
-    boot_time = tonumber((f:read("a") or ""):match("btime (%d+)"))
-    f:close()
-    if not boot_time then return nil end
-  end
-  local f = io.open("/proc/" .. pid .. "/stat")
-  if not f then return nil end
-  local stat = f:read("a") or ""
-  f:close()
-  -- Fields after the ")" that ends the process name; start time is field 22,
-  -- the 20th one here, counted in clock ticks (100 per second) since boot.
-  local rest = stat:match("%)%s+(.*)$")
-  if not rest then return nil end
-  local n, ticks = 0, nil
-  for field in rest:gmatch("%S+") do
-    n = n + 1
-    if n == 20 then ticks = tonumber(field); break end
-  end
-  return ticks and (boot_time + ticks / 100) or nil
-end
-
--- The exact match to save for a window.
-local function match_for(w)
-  local class = w.class or ""
-  if class == "" then return "title:" .. (w.title or "") end
-  if SHARED_CLASSES[string.lower(class)] and (w.title or "") ~= "" then
-    return class .. " title:" .. w.title
-  end
-  return class
-end
-
--- The window this app's launch (at time `since`) produced, or nil. If there
--- are several, it's the one whose process started first: whatever the app
--- launches in turn (a game started from Battle.net) inherits the same record
--- but always starts later.
-local function launched_window(app, since)
-  local first, first_start = nil, math.huge
-  for _, w in ipairs(hl.get_windows()) do
-    if w.class ~= "org.quickshell" and launch_record(w.pid) == app.id then
-      local started = process_start(w.pid)
-      -- A window that is another launcher entry's own app (e.g. Heroic's
-      -- window when Heroic starts in order to launch a game) isn't this app.
-      local other = w.class ~= app.id
-        and (has_entry(w.class) or has_entry(string.lower(w.class or "")))
-      if started and started >= since - 1 and not other and started < first_start then
-        first, first_start = w, started
-      end
-    end
-  end
-  return first
-end
-
--- If this app's launch produced a window, save an exact match for it.
-local function learn(app, since)
-  local win = launched_window(app, since)
-  if not win then return nil end
-  local learned = load_learned()
-  learned[app.id] = { match = match_for(win), under = app.match or "" }
-  save_learned(learned)
-  return win
-end
-
--- The app's window, found in order of confidence:
---   1. the row's window match (default or user-set)
---   2. the match App Binder learned when it launched the app, as long as the
---      row's own match hasn't been changed since
---   3. Steam games: Proton names a game's window steam_app_<id>, the same id
---      as the steam://rungameid/<id> its launcher entry runs
---   4. a window class that is the app's ID or name, ignoring case, spaces,
---      punctuation and a version number on the name
---   5. a window title that is the app's name, compared the same way. This
---      covers games from launchers such as Heroic, which share a generic
---      window class.
--- 4 and 5 are guesses for apps App Binder hasn't launched (and learned) yet.
+-- The app's window, most confident first: its window match (set by you, or
+-- learned by the plugin the first time App Binder launched the app), then
+-- Steam's steam_app_<id> class, then a class or title that is the app's ID
+-- or name (ignoring case, spaces, punctuation and a version number).
 local function find_window(app)
-  local win = best_window(matcher(app.match))
+  local win = best_window(app.test)
   if win then return win end
-  local l = load_learned()[app.id]
-  if l and l.under == (app.match or "") then
-    win = best_window(matcher(l.match))
-    if win then return win end
-  end
-  local sid = steam_id(app)
-  if sid then
-    local cls = "steam_app_" .. sid
+  if app.steam_id ~= "" then
+    local cls = "steam_app_" .. app.steam_id
     win = best_window(function(w) return w.class == cls or w.initial_class == cls end)
     if win then return win end
   end
-  local keys = app_keys(app)
+  local keys = app.names
+  if next(keys) == nil then return nil end
   win = best_window(function(w) return keys[squash(w.class)] or keys[squash(w.initial_class)] end)
   if win then return win end
   return best_window(function(w) return keys[squash(w.title)] end)
 end
 
-local function shell_quote(s)
-  return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
+-- The window used just before the focused one, skipping App Binder's own.
+local function previous_window()
+  local best, best_rank = nil, math.huge
+  for _, w in ipairs(hl.get_windows()) do
+    local rank = w.focus_history_id
+    if w.class ~= "org.quickshell" and type(rank) == "number" and rank > 0 and rank < best_rank then
+      best, best_rank = w, rank
+    end
+  end
+  return best
 end
 
 -- Switching desktops and focusing a window both move the mouse cursor in
 -- Hyprland (Omarchy turns on cursor.warp_on_change_workspace). App Binder
--- should never move the cursor, so it turns both warps off for its own switch
--- and then restores whatever the user's config had. If something still moved
--- the cursor, it is put back where it was.
+-- never moves the cursor: it turns both warps off for its own switch, puts
+-- your settings back, and returns the cursor if something still moved it.
 local function keep_cursor(fn)
   local pos = hl.get_cursor_pos()
   local no_warps = hl.get_config("cursor.no_warps")
@@ -367,52 +220,64 @@ local function keep_cursor(fn)
   if not ok then error(err, 0) end
 end
 
--- Apps launched but whose window hasn't appeared yet. Some take a long time:
--- a game started through Heroic and Wine can take most of a minute. Pressing
--- the shortcut again in that time must not start a second copy, so it goes to
--- the app's desktop and waits instead. Kept in a file because a config reload
--- (which App Binder does after every save) resets Hyprland's Lua state.
-local LAUNCH_GRACE = 60 -- seconds
-local PENDING = (os.getenv("XDG_RUNTIME_DIR") or "/tmp") .. "/app-binder-launching.lua"
+-- --------------------------------------------------------- pending launches
+-- Apps launched whose window hasn't appeared yet. Some take most of a
+-- minute (a game through Heroic and Wine); pressing the shortcut again in
+-- that time goes to the app's desktop instead of starting a second copy.
+-- Kept in memory and in a small file, because a config reload resets
+-- Hyprland's Lua state. The plugin also reads the file, to learn the window.
 
-local function load_pending()
-  local ok, t = pcall(dofile, PENDING)
-  return (ok and type(t) == "table") and t or {}
-end
-
-local function save_pending(t)
-  local f = io.open(PENDING, "w")
-  if not f then return end
-  f:write("return {\n")
-  for id, p in pairs(t) do
-    f:write(string.format("  [%q] = { t = %d, desktop = %d },\n", id, p.t or 0, p.desktop or 0))
-  end
-  f:write("}\n")
-  f:close()
-end
-
--- The window used just before the focused one, skipping App Binder's own
--- window. Hyprland numbers focus history from 0 (the focused window) up.
-local function previous_window()
-  local best, best_rank = nil, math.huge
-  for _, w in ipairs(hl.get_windows()) do
-    local rank = w.focus_history_id
-    if w.class ~= "org.quickshell" and type(rank) == "number" and rank > 0 and rank < best_rank then
-      best, best_rank = w, rank
+local pending = rawget(_G, "__app_binder_pending")
+if type(pending) ~= "table" then
+  pending = {}
+  for line in (read_file(PENDING, 65536) or ""):gmatch("[^\n]+") do
+    local t = tokens(line)
+    local id, at, desktop = decode(t[2]), math.tointeger(tonumber(t[3])), math.tointeger(tonumber(t[4]))
+    local now = os.time()
+    if t[1] == "P" and id and #id <= 1024 and at and desktop
+      and at >= now - LAUNCH_GRACE and at <= now + 5 and desktop >= 0 and desktop <= 10 then
+      pending[id] = { t = at, desktop = desktop }
     end
   end
-  return best
+  rawset(_G, "__app_binder_pending", pending)
+end
+
+local function save_pending()
+  if not PENDING then return end
+  local now, lines = os.time(), {}
+  for id, p in pairs(pending) do
+    local age = now - p.t
+    if age >= 0 and age < LAUNCH_GRACE then
+      lines[#lines + 1] = string.format("P %s %d %d", encode(id), p.t, p.desktop)
+    else
+      pending[id] = nil
+    end
+  end
+  local tmp = PENDING .. ".tmp"
+  local f = io.open(tmp, "wb")
+  if not f then return end
+  f:write(table.concat(lines, "\n"), "\n")
+  f:close()
+  os.rename(tmp, PENDING)
+end
+
+-- ---------------------------------------------------------------- activate
+
+local function launch(app)
+  if #app.tui > 0 then
+    local words = {}
+    for i, w in ipairs(app.tui) do words[i] = o.shell_quote(w) end
+    hl.exec_cmd("omarchy-launch-tui " .. table.concat(words, " "))
+  else
+    hl.exec_cmd("uwsm-app -- gtk-launch " .. o.shell_quote(app.id .. ".desktop"))
+  end
 end
 
 local function activate(app)
-  local pending = load_pending()
-  local p = pending[app.id]
-  -- After a launch, the launch record is the strongest evidence there is.
-  local win = p and learn(app, p.t or 0) or find_window(app)
+  local win = find_window(app)
   if win then
-    if p then pending[app.id] = nil; save_pending(pending) end
-    -- Already on this app: the shortcut works as a toggle and goes back to
-    -- the window you came from.
+    if pending[app.id] then pending[app.id] = nil; pcall(save_pending) end
+    -- Already on this app: the shortcut toggles back to where you were.
     local active = hl.get_active_window()
     if active and active.address == win.address then
       local back = previous_window()
@@ -424,52 +289,111 @@ local function activate(app)
   end
 
   local now = os.time()
-  local name = app.name or app.id
-  if p and now - (p.t or 0) < LAUNCH_GRACE then
-    if (p.desktop or 0) > 0 then keep_cursor(function() linked.switch(p.desktop) end) end
-    local wait = LAUNCH_GRACE - (now - p.t)
-    notify(name .. " is still starting. If it doesn't appear, press again after "
-      .. wait .. " s to launch it again.")
+  local p = pending[app.id]
+  -- A launch counts as still starting for LAUNCH_GRACE seconds. A negative
+  -- age (the clock was set back) counts as expired, never as forever.
+  if p and now - p.t >= 0 and now - p.t < LAUNCH_GRACE then
+    if p.desktop > 0 then keep_cursor(function() linked.switch(p.desktop) end) end
+    notify(app.name .. " is still starting. If it doesn't appear, press again after "
+      .. (LAUNCH_GRACE - (now - p.t)) .. " s to launch it again.")
     return
   end
 
-  local desktop = tonumber(app.desktop) or 0
-  if desktop < 1 or desktop > 10 then desktop = linked.first_empty() end
-  if desktop then keep_cursor(function() linked.switch(desktop) end) end
-  pending[app.id] = { t = now, desktop = desktop or 0 }
-  save_pending(pending)
-  hl.exec_cmd("uwsm-app -- gtk-launch " .. shell_quote(app.id .. ".desktop"))
+  local desktop = app.desktop
+  if desktop < 1 then desktop = linked.first_empty() or 0 end
+  if desktop > 0 then keep_cursor(function() linked.switch(desktop) end) end
+  pending[app.id] = { t = now, desktop = desktop }
+  launch(app)
+  pcall(save_pending) -- launching never depends on this file being writable
 end
 
-local function exists(path)
-  local f = io.open(path)
-  if f then f:close() end
-  return f ~= nil
+-- ------------------------------------------------------------- the binds
+
+-- Bindings are removed by their key strings, never through keybind objects
+-- kept from an earlier run. Hyprland's Lua state survives a config reload
+-- but the reload frees every binding, so a kept object can point at freed
+-- memory, and calling it crashes Hyprland. A key string is looked up fresh.
+-- The cost: unbinding a combo also removes anyone else's binding on it.
+-- App Binder only binds combos you gave it (taking over an existing binding
+-- always asks first), plus its own opener.
+
+-- A 0.2.1 pre-release kept keybind objects here. Drop them without
+-- touching them (they may already be freed); each row's keys are unbound
+-- by string below anyway.
+rawset(_G, "__app_binder_binds", nil)
+rawset(_G, "__app_binder_static", nil)
+
+for _, keys in ipairs(rawget(_G, "__app_binder_bound") or {}) do
+  if type(keys) == "string" then pcall(hl.unbind, keys) end
+end
+local bound = {}
+rawset(_G, "__app_binder_bound", bound)
+
+pcall(hl.unbind, OPENER)
+if pcall(o.bind, OPENER, "App Binder", { panel = PLUGIN_ID }) then bound[#bound + 1] = OPENER end
+
+-- Empty submap used while the plugin records a shortcut, so the pressed
+-- combo reaches the plugin instead of firing its current binding. The
+-- plugin always leaves it; this is the manual escape hatch. Defined once per
+-- Hyprland session.
+if not rawget(_G, "__app_binder_submap") then
+  pcall(hl.define_submap, "appbinder", function()
+    hl.bind("SUPER + CTRL + ALT + SHIFT + Escape", hl.dsp.submap("reset"))
+  end)
+  rawset(_G, "__app_binder_submap", true)
 end
 
-local data_path = exists(DATA) and DATA or (exists(LEGACY_DATA) and LEGACY_DATA or nil)
-local ok, apps = true, {}
-if data_path then ok, apps = pcall(dofile, data_path) end
-if not ok then
-  notify("App Binder: could not load " .. data_path .. ": " .. tostring(apps))
-  apps = {}
+if not RUNTIME then
+  if not rawget(_G, "__app_binder_warned") then
+    notify("App Binder: XDG_RUNTIME_DIR isn't set, so app shortcuts are off.")
+    rawset(_G, "__app_binder_warned", true)
+  end
+  return
 end
 
-for _, app in ipairs(apps or {}) do
-  if type(app) == "table" and app.keys and app.keys ~= "" and app.id then
-    pcall(hl.unbind, app.keys)
-    -- Bindings the user chose to take over. Hyprland may register the same
-    -- key by name ("SUPER + CTRL + B") rather than by code, so the plugin
-    -- records each one's own spelling. A config reload brings them back.
-    for _, combo in ipairs(app.replaces or {}) do pcall(hl.unbind, combo) end
-    local done, err = pcall(o.bind, app.keys, "App Binder: " .. (app.name or app.id),
-      function() activate(app) end)
-    if done then
-      table.insert(bound, app.keys)
+local text = read_file(BINDINGS, MAX_FILE) or ""
+local rows, skipped = {}, 0
+for line in text:gmatch("[^\n]+") do
+  local t = tokens(line)
+  if t[1] == "B" and #rows < MAX_ROWS then
+    -- B id name keys match desktop steam_id tui-words replaces names
+    local row = {
+      id = decode(t[2]), name = decode(t[3]), keys = decode(t[4]), match = decode(t[5]),
+      desktop = tonumber(decode(t[6]) or ""), steam_id = decode(t[7]),
+      tui = decode_list(t[8]), replaces = decode_list(t[9]), name_keys = decode_list(t[10]),
+    }
+    -- Limits are in bytes: the plugin caps text at 256 characters, which is
+    -- at most 1024 bytes in UTF-8.
+    local valid = row.id and row.id ~= "" and #row.id <= 1024
+      and row.name and #row.name <= 1024
+      and row.keys and #row.keys <= 128 and row.keys:match("^[%w %+:_]+$")
+      and row.match and #row.match <= 1024
+      and row.desktop and row.desktop == math.floor(row.desktop) and row.desktop >= 0 and row.desktop <= 10
+      and row.steam_id and row.steam_id:match("^%d*$") and #row.steam_id <= 20
+      and row.tui and #row.tui <= 64 and row.replaces and #row.replaces <= 16
+      and row.name_keys and #row.name_keys <= 8
+    if valid then
+      row.test = matcher(row.match)
+      row.names = {}
+      for _, k in ipairs(row.name_keys) do if k ~= "" then row.names[squash(k)] = true end end
+      rows[#rows + 1] = row
     else
-      notify("App Binder: could not bind " .. app.keys .. ": " .. tostring(err))
+      skipped = skipped + 1
     end
   end
 end
+if skipped > 0 then notify("App Binder: skipped " .. skipped .. " damaged shortcut entries.") end
 
-rawset(_G, "__app_binder_bound", bound)
+for _, app in ipairs(rows) do
+  -- Bindings you chose to take over. A config reload brings them back.
+  for _, combo in ipairs(app.replaces) do
+    if combo:match("^[%w %+:_]+$") then pcall(hl.unbind, combo) end
+  end
+  pcall(hl.unbind, app.keys)
+  local ok, err = pcall(o.bind, app.keys, "App Binder: " .. app.name, function() activate(app) end)
+  if ok then
+    bound[#bound + 1] = app.keys
+  else
+    notify("App Binder: could not bind " .. app.keys .. ": " .. tostring(err))
+  end
+end

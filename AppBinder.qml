@@ -11,9 +11,14 @@ import qs.Ui
 // the shortcut then focuses the app if it's running or launches it if not.
 //
 // Source of truth: ~/.config/omarchy/app-binder.json
-// Generated for Hyprland: ~/.config/omarchy/app-binder-data.lua, read by
+// For Hyprland: $XDG_RUNTIME_DIR/app-binder-bindings.txt, plain data read by
 // hypr/app-binder.lua, which this plugin runs inside Hyprland (hyprctl eval)
-// at startup and after every config reload. No hyprland.lua edits needed.
+// at startup, after every config reload, and when shortcuts change. No
+// hyprland.lua edits needed.
+//
+// Anything that could block (reading files other programs write, /proc,
+// scanning apps) happens here or in the helper scripts, never inside
+// Hyprland. Every input is bounded and validated before use.
 Item {
   id: root
 
@@ -24,8 +29,17 @@ Item {
   readonly property string pluginId: (manifest && manifest.id) || "cantcode.app-binder"
   readonly property string home: Quickshell.env("HOME")
   readonly property string configPath: home + "/.config/omarchy/app-binder.json"
-  readonly property string dataPath: home + "/.config/omarchy/app-binder-data.lua"
-  readonly property string legacyDataPath: home + "/.config/hypr/app-binder-data.lua"
+  // Shared with hypr/app-binder.lua. tmpfs, private to the user.
+  readonly property string runtimeDir: Quickshell.env("XDG_RUNTIME_DIR") || ""
+  readonly property string bindingsPath: runtimeDir ? runtimeDir + "/app-binder-bindings.txt" : ""
+  readonly property string pendingPath: runtimeDir ? runtimeDir + "/app-binder-pending.txt" : ""
+  // Files earlier versions wrote, removed at startup.
+  readonly property var obsoletePaths: [
+    home + "/.config/omarchy/app-binder-data.lua",
+    home + "/.config/hypr/app-binder-data.lua",
+    (Quickshell.env("XDG_STATE_HOME") || home + "/.local/state") + "/app-binder-learned.lua",
+    (Quickshell.env("XDG_RUNTIME_DIR") || "/nonexistent") + "/app-binder-launching.lua"
+  ]
   // Hyprland side, run inside Hyprland with `hyprctl eval` (see applyBindings).
   readonly property string runtimePath: decodeURIComponent(String(Qt.resolvedUrl("hypr/app-binder.lua")).replace(/^file:\/\//, ""))
   readonly property string settingsPath: home + "/.config/omarchy/app-binder-settings.jsonc"
@@ -43,11 +57,22 @@ Item {
     close_on_click_outside: true
   })
   property var settings: defaultSettings
+  // The settings file is hand-editable, so numbers are kept to the ranges
+  // the Settings sliders allow.
+  readonly property var settingRanges: ({
+    scroll_rows_per_notch: [0.25, 4],
+    scroll_glide_ms: [0, 400],
+    window_width: [700, 1800],
+    window_height: [400, 1300],
+    capture_timeout_seconds: [5, 60]
+  })
 
   function setting(name) {
     var v = root.settings ? root.settings[name] : undefined
     var d = root.defaultSettings[name]
     if (v === undefined || v === null || typeof v !== typeof d) return d
+    var r = root.settingRanges[name]
+    if (r) return isFinite(v) ? Math.min(r[1], Math.max(r[0], v)) : d
     return v
   }
 
@@ -92,6 +117,9 @@ Item {
   readonly property string defaultSettingsText: settingsText(defaultSettings)
 
   property bool settingsOpen: false
+  // True while the settings file has an error: the Settings sliders then
+  // don't save over your edits.
+  property bool settingsUnreadable: false
   property bool animateSettings: true
 
   // Change one setting from the Settings section and save the file.
@@ -99,11 +127,12 @@ Item {
     var next = ({})
     for (var k in root.defaultSettings) next[k] = root.setting(k)
     next[name] = value
+    if (root.settingsUnreadable) {
+      root.setStatus("Not saved: the settings file has an error. Fix it, or delete it to get the defaults back.", true)
+      return
+    }
     root.settings = next
-    settingsSaveProc.command = ["bash", "-c",
-      "printf '%s' \"$2\" > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"",
-      "app-binder-settings", root.settingsPath, root.settingsText(next)]
-    settingsSaveProc.running = true
+    settingsFile.setText(root.settingsText(next))
   }
 
   // JSONC: drop // line comments (outside strings) and trailing commas.
@@ -135,29 +164,33 @@ Item {
       var parsed = root.parseJsonc(text)
       var next = (parsed && typeof parsed === "object") ? parsed : root.defaultSettings
       var changed = JSON.stringify(next) !== JSON.stringify(root.settings)
+      root.settingsUnreadable = false
       root.settings = next
       if (changed && root.opened)
         root.setStatus("Settings updated (scroll: " + root.wheelRowsPerNotch + " rows per notch).", false)
     } catch (e) {
       root.settings = root.defaultSettings
+      root.settingsUnreadable = true
       root.setStatus("Settings file has an error, using defaults: " + e, true)
     }
   }
 
-  // "Edit ... directly": make sure the file exists, open it in the editor.
+  // "Edit ... directly": the file exists (created on first load), so open it
+  // the way Omarchy opens config files.
   function openSettingsFile() {
-    settingsWriteProc.running = true
+    Quickshell.execDetached(["omarchy-launch-config-editor", root.settingsPath])
   }
 
-  // id -> { name, keys, label, match, desktop }
-  property var apps: ({})
+  // id -> { name, keys, label, match, desktop }. Maps keyed by app IDs are
+  // made with Object.create(null), so an ID like "constructor" is just an ID.
+  property var apps: Object.create(null)
   property var binds: []
   property var windowClasses: []
   // Window classes that many unrelated apps share, so a class alone can't
   // tell them apart.
   readonly property var sharedClasses: ["steam_app_default"]
   // desktop id -> { file, kind, location } from scan-apps.sh
-  property var appInfo: ({})
+  property var appInfo: Object.create(null)
   readonly property string scanScript: decodeURIComponent(String(Qt.resolvedUrl("scan-apps.sh")).replace(/^file:\/\//, ""))
   readonly property var kindLabels: ({
     native: "Native", flatpak: "Flatpak", webapp: "Web app", appimage: "AppImage",
@@ -183,7 +216,15 @@ Item {
   readonly property int matchMaxLength: 256
   property string status: ""
   property bool statusError: false
-  property bool saveQueued: false
+  // A problem that leaves shortcuts not working. It stays visible (open()
+  // shows it again) and, when App Binder is closed, is sent as a
+  // notification once, until it's resolved.
+  property string stickyError: ""
+  // What App Binder last wrote, so its own writes aren't read back as edits.
+  property string lastConfigText: ""
+  // True if app-binder.json exists but couldn't be read: App Binder then
+  // never saves over it (like Omarchy's own shell.json handling).
+  property bool configUnreadable: false
 
   // Shares the menu surface tokens, like Omarchy's own overlays.
   property color background: Commons.Color.menu.background
@@ -217,7 +258,7 @@ Item {
     root.opened = true
     root.filterText = ""
     root.editingMatchId = ""
-    root.setStatus("", false)
+    root.setStatus(root.stickyError, root.stickyError !== "")
     // Re-read settings on every open: editors that save by replacing the file
     // can slip past the file watcher.
     settingsFile.reload()
@@ -241,6 +282,7 @@ Item {
   }
 
   function close() {
+    if (saveTimer.running) root.saveNow()
     root.endCapture()
     root.editingMatchId = ""
     root.opened = false
@@ -256,9 +298,6 @@ Item {
     else root.open("{}")
   }
 
-  Component.onDestruction: {
-    if (root.captureId !== "") Quickshell.execDetached(["hyprctl", "dispatch", "hl.dsp.submap('reset')"])
-  }
 
   // ---------------------------------------------------------------- rows
 
@@ -267,17 +306,27 @@ Item {
     return cls.length > 0 ? cls : id
   }
 
-  function iconFor(icon) {
+  // A row's icon. An absolute icon path is used only if scan-apps.sh vouched
+  // for it (a regular, readable file of sane size): a named pipe handed to
+  // the image loader would stall image loading for the whole shell.
+  function iconFor(icon, id) {
     var value = String(icon || "")
     if (value.length === 0) return Quickshell.iconPath("application-x-executable", true)
-    if (value.charAt(0) === "/") return "file://" + value
+    if (value.charAt(0) === "/") {
+      var info = root.appInfo[id]
+      if (!info || info.icon !== value) return Quickshell.iconPath("application-x-executable", true)
+      return "file://" + value.split("/").map(encodeURIComponent).join("/")
+    }
+    // Anything else must be a plain theme icon name: "../" or other path
+    // parts would let the theme lookup reach an arbitrary file.
+    if (!/^[A-Za-z0-9][A-Za-z0-9._+-]{0,254}$/.test(value)) return Quickshell.iconPath("application-x-executable", true)
     var themed = Quickshell.iconPath(value, true)
     return themed.length > 0 ? themed : Quickshell.iconPath("application-x-executable", true)
   }
 
   function rebuild() {
     var values = DesktopEntries.applications.values || []
-    var seen = ({})
+    var seen = Object.create(null)
     var list = []
     for (var i = 0; i < values.length; i++) {
       var entry = values[i]
@@ -355,13 +404,59 @@ Item {
 
   // ---------------------------------------------------------------- config
 
-  function loadConfig(text) {
+  readonly property int maxApps: 1000
+  readonly property var keysPattern: /^[A-Za-z0-9 +:_]+$/
+
+  // One app's saved settings, with every field checked: the file is
+  // hand-editable and anything unexpected is dropped rather than trusted.
+  function cleanApp(a) {
+    if (!a || typeof a !== "object" || Array.isArray(a)) return null
+    function str(v, max) { return typeof v === "string" ? v.slice(0, max) : "" }
+    var out = {
+      name: str(a.name, 256),
+      keys: str(a.keys, 128),
+      label: str(a.label, 64),
+      match: str(a.match, root.matchMaxLength),
+      desktop: 0,
+      desktopAuto: a.desktopAuto === true
+    }
+    if (out.keys !== "" && !root.keysPattern.test(out.keys)) { out.keys = ""; out.label = "" }
+    var d = Number(a.desktop)
+    if (d === Math.floor(d) && d >= 0 && d <= 10) out.desktop = d
+    // Missing (not empty) means "saved before 0.2.0": migrateReplaces fills it.
+    if (Array.isArray(a.replaces)) {
+      out.replaces = a.replaces.filter(function(c) {
+        return typeof c === "string" && c.length <= 128 && root.keysPattern.test(c)
+      }).slice(0, 16)
+    }
+    return out
+  }
+
+  function loadConfig(text, missing) {
+    if (text === root.lastConfigText && !missing) return // our own save, read back
+    var next = Object.create(null)
+    var dropped = 0
     try {
-      var parsed = JSON.parse(text || "{}")
-      root.apps = (parsed && parsed.apps) ? parsed.apps : ({})
+      var parsed = missing ? {} : JSON.parse(text)
+      var apps = parsed && typeof parsed === "object" && parsed.apps && typeof parsed.apps === "object" ? parsed.apps : {}
+      var ids = Object.keys(apps)
+      for (var i = 0; i < ids.length; i++) {
+        var id = ids[i]
+        var clean = (Object.keys(next).length < root.maxApps && id.length > 0 && id.length <= 256
+          && !/[\u0000-\u001f\u007f]/.test(id)) ? root.cleanApp(apps[id]) : null
+        if (clean) next[id] = clean
+        else dropped++
+      }
+      root.configUnreadable = false
     } catch (e) {
-      root.setStatus("App Binder: could not parse " + root.configPath + " (" + e + ")", true)
-      root.apps = ({})
+      root.configUnreadable = true
+      root.reportProblem("Couldn't read " + root.configPath + " (" + e + "). Shortcuts are off, and App Binder won't save over the file until it's fixed.")
+    }
+    if (!root.configUnreadable) {
+      root.clearProblem()
+      root.apps = next
+      if (dropped > 0) root.setStatus("Ignored " + dropped + " damaged entries in " + root.configPath + ".", true)
+      root.writeBindings()
     }
     if (root.opened) root.rebuild()
   }
@@ -369,7 +464,7 @@ Item {
   // Merge `patch` into one app's settings and save.
   function setApp(id, patch) {
     var row = root.rowById(id)
-    var next = ({})
+    var next = Object.create(null)
     for (var k in root.apps) next[k] = root.apps[k]
     var cur = next[id] ? JSON.parse(JSON.stringify(next[id])) : ({})
     for (var p in patch) cur[p] = patch[p]
@@ -386,7 +481,7 @@ Item {
   }
 
   function clearKeysElsewhere(keys, exceptId) {
-    var next = ({})
+    var next = Object.create(null)
     var cleared = []
     for (var k in root.apps) {
       var a = root.apps[k]
@@ -405,66 +500,129 @@ Item {
     return cleared
   }
 
-  // A Lua string literal for any text. JSON's escapes aren't valid Lua
-  // (JSON writes U+0001 as \u0001; Lua needs \u{1}), and one invalid row
-  // would stop the whole data file loading. Quotes and backslashes are
-  // escaped, control characters become 3-digit decimal escapes (\001; the
-  // fixed width keeps a following digit from joining the escape), and all
-  // other text, including non-ASCII, is written as is.
-  function luaString(s) {
-    var str = String(s === undefined || s === null ? "" : s)
-    var out = "\""
+  // ------------------------------------------------- data for Hyprland
+
+  // Text with every unpaired surrogate replaced by U+FFFD, so it always
+  // encodes (encodeURIComponent throws on an unpaired surrogate).
+  function wellFormed(str) {
+    var out = ""
     for (var i = 0; i < str.length; i++) {
       var c = str.charCodeAt(i)
-      if (c === 34) out += "\\\""
-      else if (c === 92) out += "\\\\"
-      else if (c < 32 || c === 127) out += "\\" + ("00" + c).slice(-3)
-      else out += str.charAt(i)
+      if (c >= 0xD800 && c <= 0xDBFF) {
+        var n = i + 1 < str.length ? str.charCodeAt(i + 1) : 0
+        if (n >= 0xDC00 && n <= 0xDFFF) { out += str.charAt(i) + str.charAt(i + 1); i++ }
+        else out += "�"
+      } else if (c >= 0xDC00 && c <= 0xDFFF) {
+        out += "�"
+      } else {
+        out += str.charAt(i)
+      }
     }
-    return out + "\""
+    return out
   }
 
-  function buildLua() {
-    var out = "-- Generated by App Binder (SUPER+CTRL+ALT+SPACE). Don't edit by hand:\n"
-      + "-- changes are overwritten from " + root.configPath + "\n"
-      + "return {\n"
+  // A field for the bindings file: "=" plus the text percent-encoded, so it
+  // never holds a space or newline. hypr/app-binder.lua decodes it as data.
+  function field(v) { return "=" + encodeURIComponent(root.wellFormed(String(v))) }
+  // A list: its items' fields joined by commas ("=a,=,=b"), "=" when empty.
+  function fieldList(list) {
+    if (list.length === 0) return "="
+    return list.map(function(v) { return root.field(v) }).join(",")
+  }
+
+  // Lowercase letters and digits only ("Vintage Story" -> "vintagestory").
+  function squash(str) { return String(str).toLowerCase().replace(/[^a-z0-9]/g, "") }
+
+  // Names that identify an app: its ID, its name, and its name without a
+  // trailing version ("Vintage Story 1.21.0" -> "Vintage Story").
+  function nameKeys(id, name) {
+    var keys = [root.squash(id), root.squash(name), root.squash(name.replace(/\s+v?\d[\w.\-]*$/, ""))]
+    return keys.filter(function(k, i) { return k !== "" && keys.indexOf(k) === i })
+  }
+
+  // The command a terminal app runs, the way Omarchy's launcher does it (it
+  // goes through omarchy-launch-tui), or [] for any other app.
+  function terminalCommand(id) {
+    var entry = DesktopEntries.byId(id)
+    if (!entry || !entry.runInTerminal) return []
+    return (entry.command || []).map(function(w) { return String(w) })
+      .filter(function(w) { return !/^%[a-zA-Z]$/.test(w) && w.length <= 4096 }).slice(0, 64)
+  }
+
+  // The bindings file: one line per bound app, plain data.
+  //   B id name keys match desktop steam_id terminal-command replaces names
+  function buildBindings() {
+    var lines = []
     var ids = Object.keys(root.apps).sort()
     for (var i = 0; i < ids.length; i++) {
-      var a = root.apps[ids[i]]
+      var id = ids[i]
+      var a = root.apps[id]
       if (!a.keys) continue
-      out += "  { id = " + root.luaString(ids[i])
-        + ", name = " + root.luaString(a.name || ids[i])
-        + ", keys = " + root.luaString(a.keys)
-        + ", replaces = { " + (a.replaces || []).map(root.luaString).join(", ") + " }"
-        + ", match = " + root.luaString(a.match || ids[i])
-        + ", desktop = " + (Number(a.desktop || 0) | 0) + " },\n"
+      var name = (a.name || id).slice(0, 256)
+      var info = root.appInfo[id]
+      var steam = info && info.kind === "steam" ? String(info.location || "").match(/rungameid\/(\d{1,20})$/) : null
+      lines.push(["B", root.field(id), root.field(name), root.field(a.keys),
+        root.field((a.match || id).slice(0, root.matchMaxLength)), root.field(a.desktop || 0),
+        root.field(steam ? steam[1] : ""), root.fieldList(root.terminalCommand(id)),
+        root.fieldList(a.replaces || []), root.fieldList(root.nameKeys(id, name))].join(" "))
     }
-    return out + "}\n"
+    return lines.join("\n") + "\n"
   }
 
-  function save() {
-    if (saveProc.running) { root.saveQueued = true; return }
+  // Combos taken over in a bindings file's text.
+  function replacesIn(text) {
+    var out = []
+    var lines = String(text || "").split("\n")
+    for (var i = 0; i < lines.length; i++) {
+      var t = lines[i].split(" ")
+      if (t[0] !== "B" || !t[8] || t[8] === "=") continue
+      var items = t[8].split(",")
+      for (var j = 0; j < items.length; j++) {
+        try { if (items[j].length > 1) out.push(decodeURIComponent(items[j].slice(1))) } catch (e) {}
+      }
+    }
+    return out
+  }
+
+  property string lastBindingsText: ""
+  property var lastReplaces: []
+  property bool reloadAfterWrite: false
+
+  // Write the bindings file if it changed, then have Hyprland pick it up.
+  // A full Hyprland reload only when a taken-over binding was released, the
+  // one case where Hyprland has to restore its original binding.
+  function writeBindings() {
+    if (!root.bindingsPath || root.configUnreadable) return
+    var text = root.buildBindings()
+    if (text === root.lastBindingsText) return
+    var now = root.replacesIn(text)
+    root.reloadAfterWrite = root.lastReplaces.some(function(c) { return now.indexOf(c) === -1 })
+    root.lastReplaces = now
+    root.lastBindingsText = text
+    bindingsFile.setText(text)
+  }
+
+  // Saves are batched: holding a key that changes a row saves once.
+  function save() { saveTimer.restart() }
+
+  function saveNow() {
+    saveTimer.stop()
+    if (root.configUnreadable) {
+      root.setStatus("Not saved: " + root.configPath + " couldn't be read. Fix or remove it first.", true)
+      return
+    }
     var json = JSON.stringify({ version: 1, apps: root.apps }, null, 2) + "\n"
-    saveProc.command = ["bash", "-c",
-      "set -e\n"
-      + "printf '%s' \"$1\" > \"$3.tmp\"\n"
-      + "printf '%s' \"$2\" > \"$4.tmp\"\n"
-      // Have Hyprland's own Lua compile (not run) the new data file before
-      // either file is replaced, so a bad save can never stop the working
-      // shortcuts from loading.
-      + "if ! out=$(hyprctl eval \"local f, e = loadfile([==[$4.tmp]==]); if not f then error(e, 0) end\" 2>&1); then\n"
-      + "  rm -f \"$3.tmp\" \"$4.tmp\"\n"
-      + "  echo \"kept your previous shortcuts, because the new shortcut file wouldn't load: $out\" >&2\n"
-      + "  exit 1\n"
-      + "fi\n"
-      + "mv \"$3.tmp\" \"$3\"\n"
-      + "mv \"$4.tmp\" \"$4\"\n"
-      + "rm -f \"$5\"\n"
-      // A full reload restores any default binding a removed shortcut had
-      // replaced; App Binder re-applies its own on the configreloaded event.
-      + "hyprctl reload >/dev/null\n",
-      "app-binder-save", json, root.buildLua(), root.configPath, root.dataPath, root.legacyDataPath]
-    saveProc.running = true
+    if (json !== root.lastConfigText) {
+      root.lastConfigText = json
+      configFile.setText(json)
+    }
+    root.writeBindings()
+  }
+
+  Timer {
+    id: saveTimer
+    interval: 300
+    onTriggered: root.saveNow()
   }
 
   // ---------------------------------------------------------------- capture
@@ -479,7 +637,7 @@ Item {
     root.pendingCapture = null
     root.selectedId = id
     // Empty submap: Hyprland stops firing its own bindings so the combo reaches us.
-    Quickshell.execDetached(["hyprctl", "dispatch", "hl.dsp.submap('appbinder')"])
+    Hyprland.dispatch("hl.dsp.submap('appbinder')")
     captureTimer.restart()
     var row = root.rowById(id)
     root.setStatus("Press the shortcut for " + (row ? row.name : id) + "…   Esc cancels · Backspace clears", false)
@@ -490,7 +648,10 @@ Item {
     root.captureId = ""
     root.pendingCapture = null
     captureTimer.stop()
-    Quickshell.execDetached(["hyprctl", "dispatch", "hl.dsp.submap('reset')"])
+    Hyprland.dispatch("hl.dsp.submap('reset')")
+    // Make sure recording mode really ended: if Hyprland is somehow still in
+    // it, every shortcut would stay dead.
+    submapCheck.restart()
     keyCatcher.forceActiveFocus()
   }
 
@@ -598,7 +759,7 @@ Item {
   // took over (e.g. Omarchy's Super+Ctrl+B Bluetooth) kept firing alongside
   // them. Taking it over always required confirming, so record it now.
   function migrateReplaces() {
-    var next = ({})
+    var next = Object.create(null)
     var changed = false
     for (var k in root.apps) {
       var a = root.apps[k]
@@ -793,7 +954,7 @@ Item {
 
   function commitMatch(id, value) {
     var row = root.rowById(id)
-    var v = String(value || "").trim()
+    var v = String(value || "").trim().slice(0, root.matchMaxLength)
     if (v === "" && row) v = row.defaultMatch
     root.editingMatchId = ""
     root.setApp(id, { match: v })
@@ -818,45 +979,64 @@ Item {
     root.statusError = isError === true
   }
 
+  function reportProblem(text) {
+    if (text === root.stickyError) return
+    root.stickyError = text
+    root.setStatus(text, true)
+    if (!root.opened) Quickshell.execDetached(["omarchy-notification-send", "App Binder", text])
+  }
+
+  function clearProblem() {
+    if (root.stickyError === "") return
+    if (root.status === root.stickyError) root.setStatus("", false)
+    root.stickyError = ""
+  }
+
   // ---------------------------------------------------------------- IO
 
   FileView {
     id: configFile
     path: root.configPath
     watchChanges: true
+    atomicWrites: true
     printErrors: false
-    onLoaded: root.loadConfig(text())
-    onLoadFailed: root.loadConfig("{}")
+    onLoaded: root.loadConfig(text(), false)
+    onLoadFailed: function(error) {
+      if (error === FileViewError.FileNotFound) root.loadConfig("", true)
+      else {
+        root.configUnreadable = true
+        root.reportProblem("Couldn't read " + root.configPath + ". Shortcuts are off, and App Binder won't save over the file until it's fixed.")
+      }
+    }
     onFileChanged: reload()
-  }
-
-  Process {
-    id: saveProc
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var errs = String(text || "").trim()
-        if (errs.length > 0) root.setStatus("Hyprland config error: " + errs, true)
-      }
-    }
-    stderr: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var err = String(text || "").trim()
-        if (err.length > 0) root.setStatus("Save failed: " + err, true)
-      }
-    }
-    onExited: {
-      bindsProc.running = true
-      if (root.saveQueued) { root.saveQueued = false; root.save() }
-    }
+    onSaveFailed: root.setStatus("Couldn't save " + root.configPath + ".", true)
   }
 
   // ------------------------------------------------ install shortcuts in Hyprland
 
+  // The plain-data file hypr/app-binder.lua reads.
+  FileView {
+    id: bindingsFile
+    path: root.bindingsPath
+    atomicWrites: true
+    printErrors: false
+    // What Hyprland has from an earlier run, so a released takeover is noticed.
+    onLoaded: root.lastReplaces = root.replacesIn(text())
+    onSaved: {
+      if (root.reloadAfterWrite) { root.reloadAfterWrite = false; reloadProc.running = true }
+      else root.applyBindings()
+    }
+    onSaveFailed: root.reportProblem("Couldn't write " + root.bindingsPath + ", so shortcut changes can't reach Hyprland.")
+  }
+
   // Run hypr/app-binder.lua inside Hyprland. Runtime bindings are wiped by
-  // every config reload, so this runs at startup and on each configreloaded.
+  // every config reload, so this runs at startup, on each configreloaded, and
+  // after the bindings file changes.
   function applyBindings() {
+    if (/\]==\]|[\u0000-\u001f]/.test(root.runtimePath)) {
+      root.setStatus("App Binder's folder path has characters it can't pass to Hyprland.", true)
+      return
+    }
     applyProc.running = false
     applyProc.running = true
   }
@@ -868,8 +1048,34 @@ Item {
       waitForEnd: true
       onStreamFinished: {
         var out = String(text || "").trim()
-        if (out !== "" && out !== "ok") root.setStatus("Couldn't install shortcuts in Hyprland: " + out, true)
+        if (out !== "" && out !== "ok") root.reportProblem("Couldn't install shortcuts in Hyprland: " + out.slice(0, 300))
+        else if (root.stickyError.indexOf("Couldn't install shortcuts") === 0) root.clearProblem()
         bindsProc.running = true
+      }
+    }
+  }
+
+  // Restores Hyprland's own binding for a combo whose takeover was removed;
+  // App Binder re-applies its shortcuts on the configreloaded event.
+  Process {
+    id: reloadProc
+    command: ["hyprctl", "reload"]
+  }
+
+  Timer {
+    id: submapCheck
+    interval: 400
+    onTriggered: submapProc.running = true
+  }
+
+  Process {
+    id: submapProc
+    command: ["hyprctl", "submap"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var current = String(text || "").trim()
+        if (root.captureId === "" && current !== "" && current !== "default") Hyprland.dispatch("hl.dsp.submap('reset')")
       }
     }
   }
@@ -877,11 +1083,178 @@ Item {
   Connections {
     target: Hyprland
     function onRawEvent(event) {
-      if (event && event.name === "configreloaded") root.applyBindings()
+      if (!event) return
+      if (event.name === "configreloaded") root.applyBindings()
+      else if (event.name === "openwindow" || event.name === "windowtitlev2") root.maybeLearn()
     }
   }
 
-  Component.onCompleted: root.applyBindings()
+  // Files from earlier versions: the old generated Lua data and learned
+  // matches. Both are rebuilt in the new format.
+  Process {
+    id: cleanupProc
+    command: ["rm", "-f", "--"].concat(root.obsoletePaths)
+  }
+
+  Component.onCompleted: {
+    cleanupProc.running = true
+    root.applyBindings()
+    scanProc.running = true
+  }
+
+  Component.onDestruction: {
+    if (saveTimer.running) root.saveNow()
+    if (root.captureId !== "") Hyprland.dispatch("hl.dsp.submap('reset')")
+  }
+
+  // ----------------------------------------------------- learning windows
+  //
+  // Linux has no reliable link from a window to the launcher entry that
+  // started it, so App Binder learns it once, when it launches an app: the
+  // standard launcher library records the entry in the app's environment,
+  // and every process the app starts inherits it. The first window whose
+  // process carries that record and started after the launch is the app.
+  // Its match is saved as the row's window match (visible, and editable).
+  //
+  // The record can be stale: a launcher already running (Steam, Heroic)
+  // passes on whatever started it, and so does a terminal. So it only counts
+  // for processes newer than the launch, and never for a window that is
+  // itself another app's own window.
+
+  readonly property string launchInfoScript: decodeURIComponent(String(Qt.resolvedUrl("launch-info.sh")).replace(/^file:\/\//, ""))
+  readonly property int launchGraceSeconds: 60
+  // id -> { t, desktop }: launches hypr/app-binder.lua is waiting on.
+  property var pendingLaunches: Object.create(null)
+  property var learnWindows: []
+
+  function loadPending(text) {
+    var next = Object.create(null)
+    var lines = String(text || "").split("\n").slice(0, 1000)
+    for (var i = 0; i < lines.length; i++) {
+      var t = lines[i].split(" ")
+      if (t[0] !== "P" || !t[1] || t[1].charAt(0) !== "=") continue
+      try {
+        var id = decodeURIComponent(t[1].slice(1))
+        var at = Number(t[2])
+        if (id && isFinite(at)) next[id] = { t: at, desktop: Number(t[3]) || 0 }
+      } catch (e) {}
+    }
+    root.pendingLaunches = next
+  }
+
+  function hasRecentLaunch() {
+    var now = Date.now() / 1000
+    for (var id in root.pendingLaunches) if (now - root.pendingLaunches[id].t < root.launchGraceSeconds) return true
+    return false
+  }
+
+  function maybeLearn() { if (root.hasRecentLaunch()) learnTimer.restart() }
+
+  // The match to save for a window: its class, plus its title when the class
+  // is one many apps share; just the title if it has no class.
+  function matchFor(w) {
+    var full = w.title.trim()
+    var title = full.length > 200 ? full.slice(0, 199) + "*" : full
+    if (!w.cls) return "title:" + title
+    if (root.sharedClasses.indexOf(w.cls.toLowerCase()) !== -1 && title) return w.cls + " title:" + title
+    return w.cls
+  }
+
+  // True if a window's class is another app's own launcher entry, e.g.
+  // Heroic's window when Heroic started in order to launch a game.
+  function otherAppsWindow(cls, id) {
+    if (!cls || cls === id) return false
+    return !!(DesktopEntries.byId(cls) || DesktopEntries.byId(cls.toLowerCase()) || root.appInfo[cls])
+  }
+
+  function learnFrom(infoText) {
+    var info = Object.create(null)
+    var lines = String(infoText || "").split("\n")
+    for (var i = 0; i < lines.length; i++) {
+      var f = lines[i].split("\t")
+      if (f.length === 3) info[f[0]] = { id: f[1], start: Number(f[2]) }
+    }
+    var now = Date.now() / 1000
+    for (var id in root.pendingLaunches) {
+      var p = root.pendingLaunches[id]
+      var a = root.apps[id]
+      if (now - p.t >= root.launchGraceSeconds || !a || !a.keys) continue
+      var row = root.rowById(id)
+      var defaultMatch = row ? row.defaultMatch : id
+      // A window match you set yourself always wins.
+      if (a.match && a.match !== defaultMatch) continue
+      var best = null
+      for (var j = 0; j < root.learnWindows.length; j++) {
+        var w = root.learnWindows[j]
+        var rec = info[String(w.pid)]
+        if (!rec || rec.id !== id || !(rec.start >= p.t - 1) || root.otherAppsWindow(w.cls, id)) continue
+        if (!best || rec.start < best.start) best = { w: w, start: rec.start }
+      }
+      if (!best) continue
+      var learned = root.matchFor(best.w)
+      if (learned && learned !== a.match) root.setApp(id, { match: learned })
+    }
+  }
+
+  Timer {
+    id: learnTimer
+    interval: 500
+    onTriggered: learnClientsProc.running = true
+  }
+
+  Process {
+    id: learnClientsProc
+    command: ["hyprctl", "-j", "clients"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var wins = []
+        var pids = []
+        try {
+          var list = JSON.parse(text)
+          for (var i = list.length - 1; i >= 0 && wins.length < 64; i--) {
+            var c = list[i]
+            var pid = Number(c.pid)
+            if (!(pid > 0) || c["class"] === "org.quickshell") continue
+            wins.push({ pid: pid, cls: String(c["class"] || "").slice(0, 200), title: String(c.title || "") })
+            if (pids.indexOf(String(pid)) === -1) pids.push(String(pid))
+          }
+        } catch (e) { return }
+        if (pids.length === 0) return
+        root.learnWindows = wins
+        launchInfoProc.command = ["bash", root.launchInfoScript].concat(pids)
+        launchInfoProc.running = true
+      }
+    }
+  }
+
+  // Reads /proc for the windows' processes (see launch-info.sh).
+  Process {
+    id: launchInfoProc
+    onRunningChanged: running ? launchInfoDeadline.restart() : launchInfoDeadline.stop()
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.learnFrom(text)
+    }
+  }
+
+  Timer {
+    id: launchInfoDeadline
+    interval: 5000
+    onTriggered: if (launchInfoProc.running) launchInfoProc.running = false
+  }
+
+  FileView {
+    id: pendingFile
+    path: root.pendingPath
+    watchChanges: true
+    printErrors: false
+    onLoaded: root.loadPending(text())
+    onLoadFailed: root.pendingLaunches = Object.create(null)
+    onFileChanged: reload()
+  }
+
+  // ------------------------------------------------------- other processes
 
   Process {
     id: bindsProc
@@ -906,15 +1279,18 @@ Item {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        var next = ({})
         var lines = String(text || "").split("\n")
+        while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop()
+        if (lines.length === 0 || lines[lines.length - 1] !== "END") return // stopped partway
+        var next = Object.create(null)
         for (var i = 0; i < lines.length; i++) {
           var f = lines[i].split("\t")
-          if (f.length < 4 || !f[0]) continue
-          next[f[0]] = { file: f[1], kind: f[2], location: f[3] }
+          if (f.length < 5 || !f[0]) continue
+          next[f[0]] = { file: f[1], kind: f[2], location: f[3], icon: f[4] }
         }
         root.appInfo = next
         if (root.opened) root.rebuild()
+        root.writeBindings()
       }
     }
   }
@@ -935,15 +1311,16 @@ Item {
         // One chip per class. A class that several different apps share
         // (Proton gives games it has no ID for "steam_app_default") gets one
         // chip per window instead, matching class and title together.
-        var titles = ({})
+        // Titles come from any app, so they're cut to a sane length.
+        var titles = Object.create(null)
         try {
           var list = JSON.parse(text)
-          for (var i = 0; i < list.length; i++) {
-            var c = String(list[i].class || "")
+          for (var i = 0; i < list.length && i < 200; i++) {
+            var c = String(list[i]["class"] || "").slice(0, 200)
             if (!c || c === "org.quickshell") continue
             if (!titles[c]) titles[c] = []
-            var t = String(list[i].title || "").trim()
-            if (t && titles[c].indexOf(t) === -1) titles[c].push(t)
+            var t = String(list[i].title || "").trim().slice(0, 200)
+            if (t && titles[c].indexOf(t) === -1 && titles[c].length < 20) titles[c].push(t)
           }
         } catch (e) {}
         var out = []
@@ -956,7 +1333,7 @@ Item {
           }
         }
         out.sort()
-        root.windowClasses = out
+        root.windowClasses = out.slice(0, 100)
       }
     }
   }
@@ -965,31 +1342,20 @@ Item {
     id: settingsFile
     path: root.settingsPath
     watchChanges: true
+    atomicWrites: true
     printErrors: false
     onLoaded: root.loadSettings(text())
-    onLoadFailed: { root.settings = root.defaultSettings; settingsCreateProc.running = true }
+    onLoadFailed: function(error) {
+      root.settings = root.defaultSettings
+      // Create it with documented defaults, but never over a file that exists.
+      if (error === FileViewError.FileNotFound) settingsFile.setText(root.defaultSettingsText)
+    }
     onFileChanged: reload()
-  }
-
-  // Create the settings file with documented defaults if it doesn't exist.
-  Process {
-    id: settingsCreateProc
-    command: ["bash", "-c", "[ -e \"$1\" ] || printf '%s' \"$2\" > \"$1\"",
-      "app-binder-settings", root.settingsPath, root.defaultSettingsText]
-  }
-
-  Process { id: settingsSaveProc }
-
-  // Make sure the settings file exists, then open it in Omarchy's default editor.
-  Process {
-    id: settingsWriteProc
-    command: ["bash", "-c", "[ -e \"$1\" ] || printf '%s' \"$2\" > \"$1\"; exec omarchy-launch-editor \"$1\"",
-      "app-binder-settings", root.settingsPath, root.defaultSettingsText]
   }
 
   Timer {
     id: captureTimer
-    interval: Math.max(5, root.setting("capture_timeout_seconds")) * 1000
+    interval: root.setting("capture_timeout_seconds") * 1000
     onTriggered: {
       root.endCapture()
       root.setStatus("Stopped waiting for a shortcut.", false)
@@ -998,7 +1364,10 @@ Item {
 
   Connections {
     target: DesktopEntries.applications
-    function onValuesChanged() { if (root.opened) { root.rebuild(); scanProc.running = true } }
+    function onValuesChanged() {
+      if (root.opened) root.rebuild()
+      scanProc.running = true
+    }
   }
 
 
@@ -1165,7 +1534,7 @@ Item {
           var base = scrollGlide.running ? scrollGlide.to : table.contentY
           var dest = Math.max(table.originY, Math.min(maxY, base - dy))
           wheel.accepted = true
-          var ms = Math.max(0, Number(root.setting("scroll_glide_ms")))
+          var ms = Style.duration(root.setting("scroll_glide_ms"))
           scrollGlide.stop()
           if (ms === 0) { table.contentY = dest; return }
           scrollGlide.duration = ms
@@ -1209,6 +1578,8 @@ Item {
           else if (k === Qt.Key_PageDown) root.select(root.selectedIndex + Math.max(1, Math.floor(table.height / root.rowHeight)))
           else if (k === Qt.Key_PageUp) root.select(root.selectedIndex - Math.max(1, Math.floor(table.height / root.rowHeight)))
           else if (k === Qt.Key_Return || k === Qt.Key_Enter) { if (row) root.startCapture(row.id) }
+          // Held keys don't repeat edits: each would be a save.
+          else if (event.isAutoRepeat && (k === Qt.Key_Right || k === Qt.Key_Left || k === Qt.Key_Delete)) { }
           else if (k === Qt.Key_Right) { if (row) root.cycleDesktop(row.id, 1) }
           else if (k === Qt.Key_Left) { if (row) root.cycleDesktop(row.id, -1) }
           else if (k === Qt.Key_Delete) {
@@ -1275,7 +1646,7 @@ Item {
             iconRotation: root.settingsOpen ? 180 : 0
             Behavior on iconRotation {
               enabled: root.animateSettings
-              NumberAnimation { duration: 380; easing.type: Easing.OutCubic }
+              NumberAnimation { duration: Style.duration(280); easing.type: Easing.OutCubic }
             }
             onClicked: root.settingsOpen = !root.settingsOpen
           }
@@ -1308,11 +1679,11 @@ Item {
           opacity: root.settingsOpen ? 1 : 0
           Behavior on height {
             enabled: root.animateSettings
-            NumberAnimation { duration: 260; easing.type: Easing.OutCubic }
+            NumberAnimation { duration: Style.duration(260); easing.type: Easing.OutCubic }
           }
           Behavior on opacity {
             enabled: root.animateSettings
-            NumberAnimation { duration: 200 }
+            NumberAnimation { duration: Style.duration(200) }
           }
 
           Item {
@@ -1479,7 +1850,7 @@ Item {
                   anchors.verticalCenter: parent.verticalCenter
                   width: root.iconSize; height: root.iconSize
                   sourceSize.width: root.iconSize; sourceSize.height: root.iconSize
-                  source: root.iconFor(rowItem.modelData.icon)
+                  source: root.iconFor(rowItem.modelData.icon, rowItem.modelData.id)
                   asynchronous: true
                   smooth: true
                   onStatusChanged: if (status === Image.Error)

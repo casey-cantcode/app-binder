@@ -9,14 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.1] - 2026-11-11
 
+A hardening release: App Binder runs inside your desktop, so it should never be able to hang it.
+
 ### Security
 
-- The window match editor no longer reads the clipboard. Qt's text fields read it automatically, with no size or time limit, so an app streaming a huge clipboard could stall the whole Omarchy shell. As a result, pasting into that field doesn't work. Pick the window from the open-window list or type the match.
+- Pressing an App Binder shortcut can no longer freeze Hyprland. The code that runs inside Hyprland no longer reads desktop files, other programs' process information, or files on disk; it reads two small files in your private runtime folder and compares bounded text. A window whose title is full of `*` characters, picked as a window match, could previously freeze the desktop for minutes.
+- A desktop entry whose icon is a special file (such as a named pipe) can no longer stall image loading in the whole Omarchy shell through App Binder's table. App Binder loads an icon file only if it is a regular file of a sane size, and otherwise only plain theme icon names.
+- The window match editor no longer reads the clipboard. Qt's text fields read it automatically, with no size or time limit, so an app streaming a huge clipboard could stall the shell. As a result, pasting into that field doesn't work. Pick the window from the open-window list or type the match.
+- App Binder no longer loads its data files as code inside Hyprland, and no longer falls back to the shared `/tmp` folder, where another user on the same machine could have planted a file.
+
+### Changed
+
+- Learned window matches now appear as the row's window match, where you can see and edit them. A match you set yourself is never replaced.
+- App Binder reloads Hyprland only when you remove a shortcut that had taken over one of Hyprland's own bindings, so that binding comes back. Other changes apply without a reload.
+- Terminal apps launch through `omarchy-launch-tui`, the way Omarchy's launcher starts them.
+- The settings file opens with Omarchy's config editor, and App Binder's animations follow Omarchy's animation setting.
 
 ### Fixed
 
-- A window match containing an invisible control character, which some game window titles have, no longer stops every App Binder shortcut from loading. App Binder also checks its shortcut file before saving, and keeps your working shortcuts if the new file wouldn't load.
-- A special file named like an app entry (such as a named pipe ending in `.desktop`) can no longer leave App Binder's app scan stuck, with no app types or locations shown. Only regular files are read, and a scan that runs too long is stopped.
+- A damaged `app-binder.json` is no longer overwritten: App Binder shows an error and leaves the file alone. Malformed entries are skipped instead of quietly breaking saves.
+- Changes made quickly, such as holding an arrow key on the desktop column, are no longer lost.
+- A very long window title picked as a window match can no longer stop App Binder from saving.
+- Recording a shortcut can no longer leave Hyprland's shortcuts switched off.
+- Problems that leave shortcuts off, such as an unreadable `app-binder.json`, now stay visible when you open App Binder and show a notification, instead of disappearing.
+- A settings file with an error is no longer overwritten when you move a slider.
+- A window match containing an invisible control character, which some game window titles have, no longer stops every App Binder shortcut from loading.
+- A special file named like an app entry (such as a named pipe ending in `.desktop`), or a file name containing line breaks, can no longer stall or confuse App Binder's app scan.
+- A damaged or clock-skewed launch record can no longer stop apps from launching, and a long non-English window title no longer stops its shortcut from working.
+- App Binder no longer removes other bindings on the same keys as its own when it re-applies its shortcuts.
+- Values in the settings file are kept within the ranges the Settings sliders allow.
 
 ## [0.2.0] - 2026-11-11
 

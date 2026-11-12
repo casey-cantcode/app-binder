@@ -709,7 +709,7 @@ Item {
     root.editingMatchId = id
     clientsProc.running = true
     var row = root.rowById(id)
-    root.setStatus("Window class to look for, optionally followed by title:<window title>. Exact match, or use * as a wildcard. Enter saves · Esc cancels", false)
+    root.setStatus("Pick the app's window below, or type a window class, optionally followed by title:<window title>. Use * as a wildcard. Enter saves · Esc cancels", false)
   }
 
   function commitMatch(id, value) {
@@ -1633,7 +1633,7 @@ Item {
           Text {
             width: parent.width
             textFormat: Text.PlainText
-            text: "Click or ↵ set shortcut · ←/→ or click desktop · click class to edit · Del clear · type to filter · Esc close"
+            text: "Click or ↵ set shortcut · ←/→ or click desktop · click match to edit · Del clear · type to filter · Esc close"
             color: root.foreground
             opacity: 0.45
             font.family: root.fontFamily

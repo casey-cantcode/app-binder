@@ -6,6 +6,7 @@
 -- reload, so nothing needs adding to hyprland.lua. Re-running it is safe: it
 -- first removes the bindings it made last time.
 -- This file turns each row into a binding:
+--   app focused     -> go back to the window you were on before
 --   app running     -> switch to its desktop and focus its most
 --                      recently used window (never starts a second copy)
 --   app not running -> switch to the row's desktop (or the first empty one
@@ -390,6 +391,19 @@ local function save_pending(t)
   f:close()
 end
 
+-- The window used just before the focused one, skipping App Binder's own
+-- window. Hyprland numbers focus history from 0 (the focused window) up.
+local function previous_window()
+  local best, best_rank = nil, math.huge
+  for _, w in ipairs(hl.get_windows()) do
+    local rank = w.focus_history_id
+    if w.class ~= "org.quickshell" and type(rank) == "number" and rank > 0 and rank < best_rank then
+      best, best_rank = w, rank
+    end
+  end
+  return best
+end
+
 local function activate(app)
   local pending = load_pending()
   local p = pending[app.id]
@@ -397,6 +411,14 @@ local function activate(app)
   local win = p and learn(app, p.t or 0) or find_window(app)
   if win then
     if p then pending[app.id] = nil; save_pending(pending) end
+    -- Already on this app: the shortcut works as a toggle and goes back to
+    -- the window you came from.
+    local active = hl.get_active_window()
+    if active and active.address == win.address then
+      local back = previous_window()
+      if back then keep_cursor(function() linked.focus_window(back) end) end
+      return
+    end
     keep_cursor(function() linked.focus_window(win) end)
     return
   end

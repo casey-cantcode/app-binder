@@ -7,8 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-11
+
 ### Added
 
+- Pressing an app's shortcut while you're already on that app takes you back to the window you were on before, so one shortcut works as a toggle.
 - App Binder learns each app's window the first time it launches the app, then recognizes it exactly from then on, including games run through Wine or Proton. Learned matches live in `~/.local/state/app-binder-learned.lua`. A window match you set by hand always wins.
 - Better recognition of apps App Binder hasn't launched yet. Steam games are matched by their Steam ID. Small differences between an app's name and its window (case, spaces, punctuation, a version number) are ignored, and an app can also be found by its window title.
 - Window matches can include a title, such as `steam_app_default title:Battle.net`, for games that share a window class. The open-window picker fills this in for you.
@@ -47,5 +50,6 @@ First public release.
 - Optional multi-monitor support: if `~/.config/hypr/linked-desktops.lua` exists, a "desktop" can span several monitors.
 - Styling from Omarchy's own shell components, so App Binder follows your theme.
 
-[unreleased]: https://github.com/casey-cantcode/app-binder/compare/v0.1.0...HEAD
+[unreleased]: https://github.com/casey-cantcode/app-binder/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/casey-cantcode/app-binder/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/casey-cantcode/app-binder/releases/tag/v0.1.0

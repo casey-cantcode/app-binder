@@ -6,12 +6,13 @@ App Binder is an [Omarchy](https://omarchy.org) shell plugin for the macOS/Rayca
 
 Assign shortcuts in a table of every installed app: click a row, press the combo, done.
 
-![App Binder: your apps, their shortcuts and desktops](preview.png)
+![App Binder: press Super+Ctrl+6 and Zen Browser comes up on desktop 6](preview.png)
 
 ## What a shortcut does
 
 - **App running:** switches to the desktop its window is on and focuses it. If it has several windows, it goes to the most recently used one. It never opens a second copy.
 - **App not running:** switches to the app's desktop (or the first empty one), then launches it there.
+- **Already on the app:** takes you back to the window you were on before, so one shortcut toggles. Peek at the terminal from the browser, press the same shortcut again, and you're back in the browser.
 
 ## Features
 
@@ -116,7 +117,7 @@ By default a "desktop" is a plain Hyprland workspace. If your setup treats a des
 
 ## Troubleshooting
 
-- **The shortcut launches a second copy instead of focusing, or says it can't find the window.** The window match doesn't fit the app's window. Open the app, click its Window match cell in App Binder, and pick its window from the open-window chips. Web apps usually need a wildcard such as `*hey.com*`, and games run through Proton need their title, such as `steam_app_default title:Battle.net`.
+- **The shortcut launches a second copy instead of focusing.** App Binder doesn't recognize the app's window yet. Launching the app with its App Binder shortcut usually teaches it. If not, set the match by hand. Open the app, click its Window match cell in App Binder, and pick its window from the open-window chips. Web apps usually need a wildcard such as `*hey.com*`, and games run through Proton need their title, such as `steam_app_default title:Battle.net`.
 - **Keyboard shortcuts stopped working while recording.** Recording pauses Hyprland's shortcuts, and they come back automatically after the recording timeout. To restore them immediately, press **Super+Ctrl+Alt+Shift+Esc**.
 - **Shortcuts missing after login or a crash.** They're installed by the Omarchy shell, which also runs your bar. Run `omarchy restart shell` and they're added again.
 - **Edits to `AppBinder.qml` don't show up.** App Binder stays loaded for the whole session, so it doesn't hot-reload. Run `omarchy restart shell`.

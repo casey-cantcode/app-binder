@@ -172,6 +172,15 @@ Item {
   property string captureId: ""
   property var pendingCapture: null
   property string editingMatchId: ""
+  // The window match being edited. App Binder handles the typing itself
+  // rather than using a Qt text field: in current Qt, every editable text
+  // field reads the clipboard whenever it changes, with no size limit or
+  // timeout, which a misbehaving clipboard owner could use to stall the
+  // shell. This editor never touches the clipboard.
+  property string matchDraft: ""
+  property int matchCursor: 0
+  property bool matchAllSelected: false
+  readonly property int matchMaxLength: 256
   property string status: ""
   property bool statusError: false
   property bool saveQueued: false
@@ -396,8 +405,23 @@ Item {
     return cleared
   }
 
+  // A Lua string literal for any text. JSON's escapes aren't valid Lua
+  // (JSON writes U+0001 as \u0001; Lua needs \u{1}), and one invalid row
+  // would stop the whole data file loading. Quotes and backslashes are
+  // escaped, control characters become 3-digit decimal escapes (\001; the
+  // fixed width keeps a following digit from joining the escape), and all
+  // other text, including non-ASCII, is written as is.
   function luaString(s) {
-    return JSON.stringify(String(s === undefined || s === null ? "" : s))
+    var str = String(s === undefined || s === null ? "" : s)
+    var out = "\""
+    for (var i = 0; i < str.length; i++) {
+      var c = str.charCodeAt(i)
+      if (c === 34) out += "\\\""
+      else if (c === 92) out += "\\\\"
+      else if (c < 32 || c === 127) out += "\\" + ("00" + c).slice(-3)
+      else out += str.charAt(i)
+    }
+    return out + "\""
   }
 
   function buildLua() {
@@ -423,8 +447,18 @@ Item {
     var json = JSON.stringify({ version: 1, apps: root.apps }, null, 2) + "\n"
     saveProc.command = ["bash", "-c",
       "set -e\n"
-      + "printf '%s' \"$1\" > \"$3.tmp\" && mv \"$3.tmp\" \"$3\"\n"
-      + "printf '%s' \"$2\" > \"$4.tmp\" && mv \"$4.tmp\" \"$4\"\n"
+      + "printf '%s' \"$1\" > \"$3.tmp\"\n"
+      + "printf '%s' \"$2\" > \"$4.tmp\"\n"
+      // Have Hyprland's own Lua compile (not run) the new data file before
+      // either file is replaced, so a bad save can never stop the working
+      // shortcuts from loading.
+      + "if ! out=$(hyprctl eval \"local f, e = loadfile([==[$4.tmp]==]); if not f then error(e, 0) end\" 2>&1); then\n"
+      + "  rm -f \"$3.tmp\" \"$4.tmp\"\n"
+      + "  echo \"kept your previous shortcuts, because the new shortcut file wouldn't load: $out\" >&2\n"
+      + "  exit 1\n"
+      + "fi\n"
+      + "mv \"$3.tmp\" \"$3\"\n"
+      + "mv \"$4.tmp\" \"$4\"\n"
       + "rm -f \"$5\"\n"
       // A full reload restores any default binding a removed shortcut had
       // replaced; App Binder re-applies its own on the configreloaded event.
@@ -706,10 +740,55 @@ Item {
 
   function startEditMatch(id) {
     root.endCapture()
+    var row = root.rowById(id)
+    root.matchDraft = row ? String(row.match || "").slice(0, root.matchMaxLength) : ""
+    root.matchCursor = root.matchDraft.length
+    root.matchAllSelected = true
     root.editingMatchId = id
     clientsProc.running = true
-    var row = root.rowById(id)
+    keyCatcher.forceActiveFocus()
     root.setStatus("Pick the app's window below, or type a window class, optionally followed by title:<window title>. Use * as a wildcard. Enter saves · Esc cancels", false)
+  }
+
+  function cancelEditMatch() {
+    root.editingMatchId = ""
+    root.setStatus("", false)
+    keyCatcher.forceActiveFocus()
+  }
+
+  // Typing in the window match editor. Plain keys only: no paste.
+  function handleMatchKey(event) {
+    event.accepted = true
+    var k = event.key
+    var mods = event.modifiers & (Qt.MetaModifier | Qt.ControlModifier | Qt.AltModifier)
+    var d = root.matchDraft
+    var c = root.matchCursor
+    var all = root.matchAllSelected
+    if (k === Qt.Key_Return || k === Qt.Key_Enter) { root.commitMatch(root.editingMatchId, d); return }
+    if (k === Qt.Key_Escape) { root.cancelEditMatch(); return }
+    if (mods === Qt.ControlModifier && k === Qt.Key_A) { root.matchAllSelected = true; return }
+    if (k === Qt.Key_Left) { c = all ? 0 : Math.max(0, c - 1); all = false }
+    else if (k === Qt.Key_Right) { c = all ? d.length : Math.min(d.length, c + 1); all = false }
+    else if (k === Qt.Key_Home) { c = 0; all = false }
+    else if (k === Qt.Key_End) { c = d.length; all = false }
+    else if (k === Qt.Key_Backspace) {
+      if (all) { d = ""; c = 0; all = false }
+      else if (c > 0) { d = d.slice(0, c - 1) + d.slice(c); c-- }
+    } else if (k === Qt.Key_Delete) {
+      if (all) { d = ""; c = 0; all = false }
+      else if (c < d.length) d = d.slice(0, c) + d.slice(c + 1)
+    } else if (mods === 0 && event.text && event.text.length === 1
+               && event.text.charCodeAt(0) >= 32 && event.text.charCodeAt(0) !== 127) {
+      if (all) { d = ""; c = 0; all = false }
+      if (d.length >= root.matchMaxLength) return
+      d = d.slice(0, c) + event.text + d.slice(c)
+      c++
+    } else {
+      return // anything else, including Ctrl+V, does nothing
+    }
+    root.matchDraft = d
+    root.matchCursor = c
+    root.matchAllSelected = all
   }
 
   function commitMatch(id, value) {
@@ -1108,6 +1187,7 @@ Item {
         Keys.priority: Keys.BeforeItem
         Keys.onPressed: function(event) {
           if (root.captureId !== "") { root.handleCaptureKey(event); return }
+          if (root.editingMatchId !== "") { root.handleMatchKey(event); return }
           var row = root.rows[root.selectedIndex]
           var k = event.key
           var mods = event.modifiers & (Qt.MetaModifier | Qt.ControlModifier | Qt.AltModifier)
@@ -1537,32 +1617,78 @@ Item {
                   color: "transparent"
                   border.width: Math.max(1, Style.space(2))
                   border.color: rowItem.textColor
-                  TextInput {
-                    id: matchInput
+                  // Plain text plus a drawn cursor; typing goes through
+                  // root.handleMatchKey. Only exists while this row edits.
+                  Loader {
+                    id: matchEditor
                     anchors.fill: parent
                     anchors.leftMargin: Style.spacing.sm
                     anchors.rightMargin: Style.spacing.sm
-                    verticalAlignment: TextInput.AlignVCenter
-                    color: rowItem.textColor
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.body
-                    clip: true
-                    onVisibleChanged: if (visible) {
-                      text = rowItem.modelData.match
-                      selectAll()
-                      forceActiveFocus()
-                    }
-                    Keys.onPressed: function(event) {
-                      if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
-                        root.commitMatch(rowItem.modelData.id, text)
-                        event.accepted = true
-                      } else if (event.key === Qt.Key_Escape) {
-                        root.editingMatchId = ""
-                        root.setStatus("", false)
-                        keyCatcher.forceActiveFocus()
-                        event.accepted = true
+                    active: rowItem.isEditing
+                    sourceComponent: Item {
+                      clip: true
+                      FontMetrics {
+                        id: metrics
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.body
+                      }
+                      readonly property real cursorX: metrics.advanceWidth(root.matchDraft.slice(0, root.matchCursor))
+                      // Scroll so the cursor stays in view.
+                      readonly property real shift: Math.min(0, width - cursorX - Style.space(4))
+
+                      // Character position closest to x (in this item's coordinates).
+                      function indexAt(x) {
+                        var target = x - shift
+                        var best = 0
+                        var bestDist = Math.abs(target)
+                        for (var i = 1; i <= root.matchDraft.length; i++) {
+                          var dist = Math.abs(metrics.advanceWidth(root.matchDraft.slice(0, i)) - target)
+                          if (dist < bestDist) { best = i; bestDist = dist }
+                        }
+                        return best
+                      }
+
+                      Rectangle {
+                        visible: root.matchAllSelected && root.matchDraft !== ""
+                        x: parent.shift
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: draftText.implicitWidth
+                        height: draftText.implicitHeight
+                        color: root.selectedBackground
+                      }
+                      Text {
+                        id: draftText
+                        x: parent.shift
+                        anchors.verticalCenter: parent.verticalCenter
+                        textFormat: Text.PlainText
+                        text: root.matchDraft
+                        color: root.matchAllSelected ? root.selectedText : rowItem.textColor
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.body
+                      }
+                      Rectangle {
+                        x: parent.shift + parent.cursorX
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: Math.max(1, Style.space(2))
+                        height: metrics.height
+                        color: rowItem.textColor
                       }
                     }
+                  }
+                  // Clicks inside the editor stay in the editor: a click
+                  // places the cursor, a double-click selects everything.
+                  MouseArea {
+                    anchors.fill: parent
+                    visible: rowItem.isEditing
+                    cursorShape: Qt.IBeamCursor
+                    onPressed: function(mouse) {
+                      if (matchEditor.item) {
+                        root.matchCursor = matchEditor.item.indexAt(mouse.x - matchEditor.x)
+                        root.matchAllSelected = false
+                      }
+                      keyCatcher.forceActiveFocus()
+                    }
+                    onDoubleClicked: root.matchAllSelected = true
                   }
                 }
               }

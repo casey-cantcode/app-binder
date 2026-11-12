@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "cantcode.app-binder",
   "name": "App Binder",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "author": "casey-cantcode",
   "description": "One shortcut per app: focus it if running, launch it if not. Assign shortcuts and a desktop to any installed app from a table.",
   "kinds": [

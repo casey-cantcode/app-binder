@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-11
+
+### Security
+
+- The window match editor no longer reads the clipboard. Qt's text fields read it automatically, with no size or time limit, so an app streaming a huge clipboard could stall the whole Omarchy shell. As a result, pasting into that field doesn't work. Pick the window from the open-window list or type the match.
+
+### Fixed
+
+- A window match containing an invisible control character, which some game window titles have, no longer stops every App Binder shortcut from loading. App Binder also checks its shortcut file before saving, and keeps your working shortcuts if the new file wouldn't load.
+
 ## [0.2.0] - 2026-11-11
 
 ### Added
@@ -50,6 +60,7 @@ First public release.
 - Optional multi-monitor support: if `~/.config/hypr/linked-desktops.lua` exists, a "desktop" can span several monitors.
 - Styling from Omarchy's own shell components, so App Binder follows your theme.
 
-[unreleased]: https://github.com/casey-cantcode/app-binder/compare/v0.2.0...HEAD
+[unreleased]: https://github.com/casey-cantcode/app-binder/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/casey-cantcode/app-binder/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/casey-cantcode/app-binder/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/casey-cantcode/app-binder/releases/tag/v0.1.0

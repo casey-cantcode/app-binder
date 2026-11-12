@@ -4,7 +4,7 @@
   "name": "App Binder",
   "version": "0.2.0",
   "author": "casey-cantcode",
-  "description": "One key per app: focus it if running, launch it if not. Assign shortcuts and a desktop to any installed app from a table.",
+  "description": "One shortcut per app: focus it if running, launch it if not. Assign shortcuts and a desktop to any installed app from a table.",
   "kinds": [
     "overlay"
   ],

@@ -1,6 +1,6 @@
 # App Binder
 
-One key per app. Press it and the app comes forward if it's running, or launches if it isn't.
+One shortcut per app. Press it and the app comes forward if it's running, or launches if it isn't.
 
 App Binder is an [Omarchy](https://omarchy.org) shell plugin for the macOS/Raycast habit of jumping straight to an app by keyboard. You choose the keys. For example, you might use `Super+Ctrl+1` for your terminal or `Super+Ctrl+M` for mail. A shortcut doesn't mean "go to a desktop and hope the app is there". It means "I want that app", wherever it is.
 

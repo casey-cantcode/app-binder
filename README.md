@@ -85,7 +85,7 @@ App Binder writes only its own files:
 
 - `~/.config/omarchy/app-binder.json`, your shortcuts
 - `~/.config/omarchy/app-binder-settings.jsonc`, settings
-- `$XDG_RUNTIME_DIR/app-binder-bindings.txt` and `app-binder-pending.txt`, small working files for Hyprland, in your private runtime folder (cleared at logout)
+- `$XDG_RUNTIME_DIR/app-binder-bindings.txt`, a copy of your shortcuts for App Binder's next start, in your private runtime folder (cleared at logout)
 
 It never edits `hyprland.lua` or any other config file. Its shortcuts are added to the running Hyprland with `hyprctl eval` (see How it works). It runs `hyprctl reload` only when you remove a shortcut that had taken over one of Hyprland's own bindings, so that binding comes back. While recording a shortcut it briefly switches Hyprland to an empty keybinding submap (see Troubleshooting). It only replaces an existing Hyprland binding when you confirm the conflict prompt.
 
@@ -98,9 +98,9 @@ It never edits `hyprland.lua` or any other config file. Its shortcuts are added 
 | `scan-apps.sh` | Classifies each desktop entry (type and location) for the second line under app names. Read-only |
 | `launch-info.sh` | Tells App Binder which launcher entry started a window's process, so it can learn the window. Read-only |
 | `~/.config/omarchy/app-binder.json` | Your shortcuts. App Binder writes this; it's the source of truth |
-| `$XDG_RUNTIME_DIR/app-binder-bindings.txt` | Your shortcuts as plain data for Hyprland to read. Rebuilt from the JSON |
+| `$XDG_RUNTIME_DIR/app-binder-bindings.txt` | The shortcuts last sent to Hyprland, so App Binder notices a released takeover after a restart. Rebuilt from the JSON; Hyprland never reads it |
 
-App Binder loads with the Omarchy shell at login and runs `hypr/app-binder.lua` inside Hyprland with `hyprctl eval`. That registers your shortcuts as ordinary Hyprland bindings (described as `App Binder: <app>` in `hyprctl binds`), so they work whether or not the window is open.
+App Binder loads with the Omarchy shell at login and sends the text of `hypr/app-binder.lua` to Hyprland with `hyprctl eval`, with your shortcuts as plain-data arguments. That registers your shortcuts as ordinary Hyprland bindings (described as `App Binder: <app>` in `hyprctl binds`), so they work whether or not the window is open.
 
 A Hyprland config reload clears bindings added this way, so App Binder listens for Hyprland's `configreloaded` event and adds them again. Running the script again never duplicates anything: it removes exactly the bindings it made last time, and never anyone else's on the same keys.
 
@@ -110,13 +110,13 @@ Apps launch the same way Omarchy's launcher starts them: terminal apps with `oma
 
 App Binder runs inside your desktop, so it's written to never be the thing that hangs it:
 
-- The code that runs inside Hyprland when you press a shortcut reads only two small files in your private runtime folder, parses them as plain data (it never runs them as code), and bounds everything it compares. Anything that could wait, such as reading other programs' files or process information, happens in the plugin or its helper scripts, which have deadlines.
+- The code that runs inside Hyprland opens no files. App Binder hands it your shortcuts and any launches still starting as plain data (never run as code), it bounds everything it compares, and it reports new launches back as Hyprland events. Anything that could wait, such as reading files or other programs' process information, happens in the plugin or its helper scripts, which have deadlines.
 - Desktop entries, window titles and App Binder's own files are treated as untrusted: only regular files are read, every read and every value has a size limit, special files (such as named pipes) are skipped, and malformed entries are ignored rather than trusted.
 - If `app-binder.json` can't be read, App Binder won't save over it, so a damaged file never costs you your shortcuts.
 
 ### Multi-monitor desktops (optional)
 
-By default a "desktop" is a plain Hyprland workspace. If your setup treats a desktop as a set of workspaces across several monitors, provide a Lua module at `~/.config/hypr/linked-desktops.lua` that returns a table with these functions, and App Binder will use them:
+By default a "desktop" is a plain Hyprland workspace. If your setup treats a desktop as a set of workspaces across several monitors, provide a Lua module at `~/.config/hypr/linked-desktops.lua` that returns a table with these functions, and load it from your Hyprland config (`require("hypr.linked-desktops")`). App Binder uses it once your config has loaded it; it never loads the file itself:
 
 | Function | Purpose |
 |---|---|

@@ -1,8 +1,10 @@
 -- App Binder runtime: per-app focus-or-launch shortcuts.
 --
--- The App Binder plugin runs this file inside Hyprland (`hyprctl eval`) when
--- the shell starts, after every config reload, and whenever the shortcuts
--- change, so nothing needs adding to hyprland.lua. Re-running it is safe.
+-- The App Binder plugin sends this file's text to Hyprland (`hyprctl eval`)
+-- when the shell starts, after every config reload, and whenever the
+-- shortcuts change, so nothing needs adding to hyprland.lua. Re-running it is
+-- safe. The plugin wraps it in a function and passes two strings: the
+-- shortcuts, and the launches still starting (see "plain data" below).
 -- Each row of the plugin's table becomes a binding:
 --   app focused     -> go back to the window you were on before
 --   app running     -> switch to its desktop and focus its most recently
@@ -11,18 +13,17 @@
 --                      then launch it there
 --
 -- This code runs on Hyprland's own thread, so it never waits on anything:
--- it reads only two small files in $XDG_RUNTIME_DIR (tmpfs, private to you),
--- parses them as plain data (never runs them as code), bounds every input,
--- and leaves all work that could block (scanning apps, learning which window
--- belongs to which app) to the plugin, outside Hyprland.
+-- it opens no files at all. Its input arrives as two strings, parsed as
+-- plain data (never run as code), with every input bounded. Launches it
+-- starts are reported back to the plugin as Hyprland events. All work that
+-- could block (reading files, scanning apps, learning which window belongs
+-- to which app) stays in the plugin, outside Hyprland.
 
-local RUNTIME = os.getenv("XDG_RUNTIME_DIR")
-local BINDINGS = RUNTIME and RUNTIME .. "/app-binder-bindings.txt" or nil
-local PENDING = RUNTIME and RUNTIME .. "/app-binder-pending.txt" or nil
+local BINDINGS_TEXT, PENDING_TEXT = ...
 local PLUGIN_ID = "cantcode.app-binder"
 local OPENER = "SUPER + CTRL + ALT + SPACE"
 
-local MAX_FILE = 4 * 1024 * 1024 -- bytes read from the bindings file
+local MAX_INPUT = 64 * 1024 -- bytes of each input string parsed
 local MAX_ROWS = 1000
 local MAX_TEXT = 512             -- bytes of a window class or title compared
 local LAUNCH_GRACE = 60          -- seconds a launch counts as still starting
@@ -31,11 +32,14 @@ local function notify(message)
   hl.exec_cmd(o.notify(message)) -- o.notify only builds the command
 end
 
--- Optional multi-monitor hook: if ~/.config/hypr/linked-desktops.lua exists
--- (a module with switch / focus_window / first_empty), a "desktop" can span
--- several monitors. Otherwise App Binder switches plain workspaces.
-local has_linked, linked = pcall(require, "hypr.linked-desktops")
-if not has_linked then
+-- Optional multi-monitor hook: if your Hyprland config loads a module
+-- "hypr.linked-desktops" (with switch / focus_window / first_empty), a
+-- "desktop" can span several monitors. Otherwise App Binder switches plain
+-- workspaces. Only an already-loaded module is used: loading one would mean
+-- opening a file on Hyprland's thread.
+local linked = package.loaded["hypr.linked-desktops"]
+if type(linked) ~= "table" or type(linked.switch) ~= "function"
+  or type(linked.focus_window) ~= "function" or type(linked.first_empty) ~= "function" then
   linked = {
     switch = function(n) hl.dispatch(hl.dsp.focus({ workspace = tostring(n) })) end,
     focus_window = function(win) hl.dispatch(hl.dsp.focus({ window = "address:" .. win.address })) end,
@@ -76,13 +80,9 @@ local function encode(s)
   return "=" .. tostring(s):gsub("[^%w%-%._~]", function(c) return string.format("%%%02X", c:byte()) end)
 end
 
-local function read_file(path, limit)
-  if not path then return nil end
-  local f = io.open(path, "rb")
-  if not f then return nil end
-  local text = f:read(limit)
-  f:close()
-  return text
+local function input(s)
+  if type(s) ~= "string" then return "" end
+  return s:sub(1, MAX_INPUT)
 end
 
 local function tokens(line)
@@ -224,41 +224,44 @@ end
 -- Apps launched whose window hasn't appeared yet. Some take most of a
 -- minute (a game through Heroic and Wine); pressing the shortcut again in
 -- that time goes to the app's desktop instead of starting a second copy.
--- Kept in memory and in a small file, because a config reload resets
--- Hyprland's Lua state. The plugin also reads the file, to learn the window.
+-- Kept in memory here and reported to the plugin as Hyprland events
+-- ("custom>>app-binder,launch,..." and "custom>>app-binder,found,..."). The
+-- plugin uses them to learn the app's window, and passes the list back on
+-- every run, because some Hyprland versions start a fresh Lua state on a
+-- config reload.
 
 local pending = rawget(_G, "__app_binder_pending")
 if type(pending) ~= "table" then
   pending = {}
-  for line in (read_file(PENDING, 65536) or ""):gmatch("[^\n]+") do
-    local t = tokens(line)
-    local id, at, desktop = decode(t[2]), math.tointeger(tonumber(t[3])), math.tointeger(tonumber(t[4]))
-    local now = os.time()
-    if t[1] == "P" and id and #id <= 1024 and at and desktop
-      and at >= now - LAUNCH_GRACE and at <= now + 5 and desktop >= 0 and desktop <= 10 then
-      pending[id] = { t = at, desktop = desktop }
-    end
-  end
   rawset(_G, "__app_binder_pending", pending)
 end
 
-local function save_pending()
-  if not PENDING then return end
-  local now, lines = os.time(), {}
-  for id, p in pairs(pending) do
-    local age = now - p.t
-    if age >= 0 and age < LAUNCH_GRACE then
-      lines[#lines + 1] = string.format("P %s %d %d", encode(id), p.t, p.desktop)
-    else
-      pending[id] = nil
+-- Lines "P id time desktop" from the plugin. The later launch wins.
+do
+  local now = os.time()
+  for line in input(PENDING_TEXT):gmatch("[^\n]+") do
+    local t = tokens(line)
+    local id, at, desktop = decode(t[2]), math.tointeger(tonumber(t[3])), math.tointeger(tonumber(t[4]))
+    if t[1] == "P" and id and id ~= "" and #id <= 1024 and at and desktop
+      and at >= now - LAUNCH_GRACE and at <= now + 5 and desktop >= 0 and desktop <= 10
+      and not (pending[id] and pending[id].t >= at) then
+      pending[id] = { t = at, desktop = desktop }
     end
   end
-  local tmp = PENDING .. ".tmp"
-  local f = io.open(tmp, "wb")
-  if not f then return end
-  f:write(table.concat(lines, "\n"), "\n")
-  f:close()
-  os.rename(tmp, PENDING)
+end
+
+-- Tells the plugin. Never fails the shortcut: it is only a hint.
+local function announce(kind, id, p)
+  local data = "app-binder," .. kind .. "," .. encode(id)
+  if p then data = data .. "," .. p.t .. "," .. p.desktop end
+  pcall(hl.dispatch, hl.dsp.event(data))
+end
+
+local function forget_expired(now)
+  for id, p in pairs(pending) do
+    local age = now - p.t
+    if age < 0 or age >= LAUNCH_GRACE then pending[id] = nil end
+  end
 end
 
 -- ---------------------------------------------------------------- activate
@@ -276,7 +279,7 @@ end
 local function activate(app)
   local win = find_window(app)
   if win then
-    if pending[app.id] then pending[app.id] = nil; pcall(save_pending) end
+    if pending[app.id] then pending[app.id] = nil; announce("found", app.id) end
     -- Already on this app: the shortcut toggles back to where you were.
     local active = hl.get_active_window()
     if active and active.address == win.address then
@@ -289,6 +292,7 @@ local function activate(app)
   end
 
   local now = os.time()
+  forget_expired(now)
   local p = pending[app.id]
   -- A launch counts as still starting for LAUNCH_GRACE seconds. A negative
   -- age (the clock was set back) counts as expired, never as forever.
@@ -304,15 +308,15 @@ local function activate(app)
   if desktop > 0 then keep_cursor(function() linked.switch(desktop) end) end
   pending[app.id] = { t = now, desktop = desktop }
   launch(app)
-  pcall(save_pending) -- launching never depends on this file being writable
+  announce("launch", app.id, pending[app.id])
 end
 
 -- ------------------------------------------------------------- the binds
 
 -- Bindings are removed by their key strings, never through keybind objects
--- kept from an earlier run. Hyprland's Lua state survives a config reload
--- but the reload frees every binding, so a kept object can point at freed
--- memory, and calling it crashes Hyprland. A key string is looked up fresh.
+-- kept from an earlier run. On some Hyprland versions the Lua state
+-- survives a config reload but the reload frees every binding, so a kept
+-- object can point at freed memory, and calling it crashes Hyprland. A key string is looked up fresh.
 -- The cost: unbinding a combo also removes anyone else's binding on it.
 -- App Binder only binds combos you gave it (taking over an existing binding
 -- always asks first), plus its own opener.
@@ -343,15 +347,7 @@ if not rawget(_G, "__app_binder_submap") then
   rawset(_G, "__app_binder_submap", true)
 end
 
-if not RUNTIME then
-  if not rawget(_G, "__app_binder_warned") then
-    notify("App Binder: XDG_RUNTIME_DIR isn't set, so app shortcuts are off.")
-    rawset(_G, "__app_binder_warned", true)
-  end
-  return
-end
-
-local text = read_file(BINDINGS, MAX_FILE) or ""
+local text = input(BINDINGS_TEXT)
 local rows, skipped = {}, 0
 for line in text:gmatch("[^\n]+") do
   local t = tokens(line)

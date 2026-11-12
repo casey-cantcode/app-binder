@@ -13,13 +13,14 @@ A hardening release: App Binder runs inside your desktop, so it should never be 
 
 ### Security
 
-- Pressing an App Binder shortcut can no longer freeze Hyprland. The code that runs inside Hyprland no longer reads desktop files, other programs' process information, or files on disk; it reads two small files in your private runtime folder and compares bounded text. A window whose title is full of `*` characters, picked as a window match, could previously freeze the desktop for minutes.
+- Pressing an App Binder shortcut can no longer freeze Hyprland. The code that runs inside Hyprland no longer opens any file, including desktop files, other programs' process information and its own working files; App Binder passes it your shortcuts as plain data and it compares bounded text. A window whose title is full of `*` characters, picked as a window match, could previously freeze the desktop for minutes.
 - A desktop entry whose icon is a special file (such as a named pipe) can no longer stall image loading in the whole Omarchy shell through App Binder's table. App Binder loads an icon file only if it is a regular file of a sane size, and otherwise only plain theme icon names.
 - The window match editor no longer reads the clipboard. Qt's text fields read it automatically, with no size or time limit, so an app streaming a huge clipboard could stall the shell. As a result, pasting into that field doesn't work. Pick the window from the open-window list or type the match.
 - App Binder no longer loads its data files as code inside Hyprland, and no longer falls back to the shared `/tmp` folder, where another user on the same machine could have planted a file.
 
 ### Changed
 
+- An optional `linked-desktops.lua` module is used only if your Hyprland config already loads it (`require("hypr.linked-desktops")`); App Binder no longer loads it itself.
 - Learned window matches now appear as the row's window match, where you can see and edit them. A match you set yourself is never replaced.
 - App Binder reloads Hyprland only when you remove a shortcut that had taken over one of Hyprland's own bindings, so that binding comes back. Other changes apply without a reload.
 - Terminal apps launch through `omarchy-launch-tui`, the way Omarchy's launcher starts them.
@@ -27,6 +28,7 @@ A hardening release: App Binder runs inside your desktop, so it should never be 
 
 ### Fixed
 
+- Apps built on Electron or Chromium whose launcher entry names their window class, such as Obsidian, are now recognized while running. Pressing their shortcut again used to say the app was still starting, or open it again, instead of switching back.
 - A damaged `app-binder.json` is no longer overwritten: App Binder shows an error and leaves the file alone. Malformed entries are skipped instead of quietly breaking saves.
 - Changes made quickly, such as holding an arrow key on the desktop column, are no longer lost.
 - A very long window title picked as a window match can no longer stop App Binder from saving.

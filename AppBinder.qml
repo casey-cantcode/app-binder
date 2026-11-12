@@ -11,14 +11,16 @@ import qs.Ui
 // the shortcut then focuses the app if it's running or launches it if not.
 //
 // Source of truth: ~/.config/omarchy/app-binder.json
-// For Hyprland: $XDG_RUNTIME_DIR/app-binder-bindings.txt, plain data read by
-// hypr/app-binder.lua, which this plugin runs inside Hyprland (hyprctl eval)
-// at startup, after every config reload, and when shortcuts change. No
-// hyprland.lua edits needed.
+// For Hyprland: hypr/app-binder.lua, which this plugin sends to Hyprland
+// (hyprctl eval) at startup, after every config reload, and when shortcuts
+// change, with the shortcuts as plain-data arguments. No hyprland.lua edits
+// needed. A copy of the shortcuts is kept in
+// $XDG_RUNTIME_DIR/app-binder-bindings.txt for the plugin's own next start.
 //
-// Anything that could block (reading files other programs write, /proc,
-// scanning apps) happens here or in the helper scripts, never inside
-// Hyprland. Every input is bounded and validated before use.
+// Anything that could block (reading any file, /proc, scanning apps)
+// happens here or in the helper scripts, never inside Hyprland: the code
+// that runs there opens no files. Every input is bounded and validated
+// before use.
 Item {
   id: root
 
@@ -32,15 +34,16 @@ Item {
   // Shared with hypr/app-binder.lua. tmpfs, private to the user.
   readonly property string runtimeDir: Quickshell.env("XDG_RUNTIME_DIR") || ""
   readonly property string bindingsPath: runtimeDir ? runtimeDir + "/app-binder-bindings.txt" : ""
-  readonly property string pendingPath: runtimeDir ? runtimeDir + "/app-binder-pending.txt" : ""
   // Files earlier versions wrote, removed at startup.
   readonly property var obsoletePaths: [
     home + "/.config/omarchy/app-binder-data.lua",
     home + "/.config/hypr/app-binder-data.lua",
     (Quickshell.env("XDG_STATE_HOME") || home + "/.local/state") + "/app-binder-learned.lua",
-    (Quickshell.env("XDG_RUNTIME_DIR") || "/nonexistent") + "/app-binder-launching.lua"
+    (Quickshell.env("XDG_RUNTIME_DIR") || "/nonexistent") + "/app-binder-launching.lua",
+    (Quickshell.env("XDG_RUNTIME_DIR") || "/nonexistent") + "/app-binder-pending.txt",
+    (Quickshell.env("XDG_RUNTIME_DIR") || "/nonexistent") + "/app-binder-pending.txt.tmp"
   ]
-  // Hyprland side, run inside Hyprland with `hyprctl eval` (see applyBindings).
+  // Hyprland side, sent to Hyprland with `hyprctl eval` (see applyBindings).
   readonly property string runtimePath: decodeURIComponent(String(Qt.resolvedUrl("hypr/app-binder.lua")).replace(/^file:\/\//, ""))
   readonly property string settingsPath: home + "/.config/omarchy/app-binder-settings.jsonc"
 
@@ -533,10 +536,16 @@ Item {
   // Lowercase letters and digits only ("Vintage Story" -> "vintagestory").
   function squash(str) { return String(str).toLowerCase().replace(/[^a-z0-9]/g, "") }
 
-  // Names that identify an app: its ID, its name, and its name without a
-  // trailing version ("Vintage Story 1.21.0" -> "Vintage Story").
+  // Names that identify an app: the window class its launcher entry
+  // declares (StartupWMClass, e.g. Obsidian's "md.obsidian.Obsidian"), its
+  // ID, its name, and its name without a trailing version
+  // ("Vintage Story 1.21.0" -> "Vintage Story"). The declared class matters
+  // for Electron and Chromium apps: they blank their own process
+  // environment, so App Binder can't learn their window at launch.
   function nameKeys(id, name) {
-    var keys = [root.squash(id), root.squash(name), root.squash(name.replace(/\s+v?\d[\w.\-]*$/, ""))]
+    var entry = DesktopEntries.byId(id)
+    var declared = entry && entry.startupClass ? String(entry.startupClass).slice(0, 256) : ""
+    var keys = [root.squash(declared), root.squash(id), root.squash(name), root.squash(name.replace(/\s+v?\d[\w.\-]*$/, ""))]
     return keys.filter(function(k, i) { return k !== "" && keys.indexOf(k) === i })
   }
 
@@ -586,20 +595,22 @@ Item {
 
   property string lastBindingsText: ""
   property var lastReplaces: []
-  property bool reloadAfterWrite: false
 
-  // Write the bindings file if it changed, then have Hyprland pick it up.
-  // A full Hyprland reload only when a taken-over binding was released, the
-  // one case where Hyprland has to restore its original binding.
+  // Send changed shortcuts to Hyprland, and keep a copy in the bindings
+  // file for the next start. A full Hyprland reload only when a taken-over
+  // binding was released, the one case where Hyprland has to restore its
+  // original binding; the configreloaded event then sends the shortcuts.
   function writeBindings() {
-    if (!root.bindingsPath || root.configUnreadable) return
+    if (root.configUnreadable) return
     var text = root.buildBindings()
     if (text === root.lastBindingsText) return
     var now = root.replacesIn(text)
-    root.reloadAfterWrite = root.lastReplaces.some(function(c) { return now.indexOf(c) === -1 })
+    var released = root.lastReplaces.some(function(c) { return now.indexOf(c) === -1 })
     root.lastReplaces = now
     root.lastBindingsText = text
-    bindingsFile.setText(text)
+    if (root.bindingsPath) bindingsFile.setText(text)
+    if (released) reloadProc.running = true
+    else root.applyBindings()
   }
 
   // Saves are batched: holding a key that changes a row saves once.
@@ -1014,7 +1025,8 @@ Item {
 
   // ------------------------------------------------ install shortcuts in Hyprland
 
-  // The plain-data file hypr/app-binder.lua reads.
+  // The shortcuts as of the plugin's last run, kept only for the plugin
+  // itself; Hyprland never reads it.
   FileView {
     id: bindingsFile
     path: root.bindingsPath
@@ -1022,34 +1034,70 @@ Item {
     printErrors: false
     // What Hyprland has from an earlier run, so a released takeover is noticed.
     onLoaded: root.lastReplaces = root.replacesIn(text())
-    onSaved: {
-      if (root.reloadAfterWrite) { root.reloadAfterWrite = false; reloadProc.running = true }
-      else root.applyBindings()
-    }
-    onSaveFailed: root.reportProblem("Couldn't write " + root.bindingsPath + ", so shortcut changes can't reach Hyprland.")
   }
 
-  // Run hypr/app-binder.lua inside Hyprland. Runtime bindings are wiped by
+  // hypr/app-binder.lua's text, read here so Hyprland never opens it.
+  property string runtimeScript: ""
+  property bool applyWanted: false
+  FileView {
+    id: runtimeFile
+    path: root.runtimePath
+    printErrors: false
+    onLoaded: {
+      root.runtimeScript = text()
+      if (root.applyWanted) root.applyBindings()
+    }
+    onLoadFailed: root.reportProblem("Couldn't read " + root.runtimePath + ", so shortcuts can't be installed.")
+  }
+
+  // Hyprland skips an eval request it finds too large (about 90 KB on 0.56)
+  // without running it, so requests stay well below that.
+  readonly property int maxRequestBytes: 60000
+
+  // Launches still starting, as lines for hypr/app-binder.lua.
+  function pendingText() {
+    var now = Date.now() / 1000
+    var lines = []
+    for (var id in root.pendingLaunches) {
+      var p = root.pendingLaunches[id]
+      if (now - p.t < root.launchGraceSeconds) lines.push(["P", root.field(id), p.t, p.desktop].join(" "))
+    }
+    return lines.join("\n") + "\n"
+  }
+
+  // Run hypr/app-binder.lua inside Hyprland, passing the shortcuts and the
+  // launches still starting as two strings. Runtime bindings are wiped by
   // every config reload, so this runs at startup, on each configreloaded, and
-  // after the bindings file changes.
+  // whenever the shortcuts change.
   function applyBindings() {
-    if (/\]==\]|[\u0000-\u001f]/.test(root.runtimePath)) {
-      root.setStatus("App Binder's folder path has characters it can't pass to Hyprland.", true)
+    if (root.runtimeScript === "") { root.applyWanted = true; return }
+    root.applyWanted = false
+    var data = root.lastBindingsText
+    var launches = root.pendingText()
+    // Both are percent-encoded, so they never hold "]" and can't end the
+    // Lua long strings they're sent in.
+    if (/\]/.test(data) || /\]/.test(launches)) return
+    // The script starts with a comment, so the wrapper shares its first line
+    // and Lua error line numbers match the file.
+    var request = "(function(...) " + root.runtimeScript + "\nend)([==[" + data + "]==], [==[" + launches + "]==])"
+    // UTF-8 bytes: each percent escape is one byte.
+    if (encodeURIComponent(request).replace(/%[0-9A-F]{2}/g, "x").length > root.maxRequestBytes) {
+      root.reportProblem("Too many shortcuts to send to Hyprland at once. Remove some, or shorten long window matches.")
       return
     }
     applyProc.running = false
+    applyProc.command = ["hyprctl", "eval", request]
     applyProc.running = true
   }
 
   Process {
     id: applyProc
-    command: ["hyprctl", "eval", "dofile([==[" + root.runtimePath + "]==])"]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
         var out = String(text || "").trim()
-        if (out !== "" && out !== "ok") root.reportProblem("Couldn't install shortcuts in Hyprland: " + out.slice(0, 300))
-        else if (root.stickyError.indexOf("Couldn't install shortcuts") === 0) root.clearProblem()
+        if (out !== "ok") root.reportProblem("Couldn't install shortcuts in Hyprland: " + (out === "" ? "no reply." : out.slice(0, 300)))
+        else if (root.stickyError.indexOf("Couldn't install shortcuts") === 0 || root.stickyError.indexOf("Too many shortcuts") === 0) root.clearProblem()
         bindsProc.running = true
       }
     }
@@ -1085,6 +1133,7 @@ Item {
     function onRawEvent(event) {
       if (!event) return
       if (event.name === "configreloaded") root.applyBindings()
+      else if (event.name === "custom") root.launchEvent(String(event.data || "").slice(0, 4096))
       else if (event.name === "openwindow" || event.name === "windowtitlev2") root.maybeLearn()
     }
   }
@@ -1127,19 +1176,27 @@ Item {
   property var pendingLaunches: Object.create(null)
   property var learnWindows: []
 
-  function loadPending(text) {
+  // "app-binder,launch,<id>,<time>,<desktop>" when hypr/app-binder.lua
+  // launches an app, "app-binder,found,<id>" when its window turned up.
+  // Other plugins' custom events are ignored.
+  function launchEvent(data) {
+    var f = data.split(",")
+    if (f[0] !== "app-binder" || !f[2] || f[2].charAt(0) !== "=") return
+    var id
+    try { id = decodeURIComponent(f[2].slice(1)) } catch (e) { return }
+    if (!id || id.length > 1024) return
     var next = Object.create(null)
-    var lines = String(text || "").split("\n").slice(0, 1000)
-    for (var i = 0; i < lines.length; i++) {
-      var t = lines[i].split(" ")
-      if (t[0] !== "P" || !t[1] || t[1].charAt(0) !== "=") continue
-      try {
-        var id = decodeURIComponent(t[1].slice(1))
-        var at = Number(t[2])
-        if (id && isFinite(at)) next[id] = { t: at, desktop: Number(t[3]) || 0 }
-      } catch (e) {}
-    }
+    for (var k in root.pendingLaunches) next[k] = root.pendingLaunches[k]
+    if (f[1] === "found") delete next[id]
+    else if (f[1] === "launch") {
+      var at = Number(f[3]), desktop = Number(f[4])
+      var now = Date.now() / 1000
+      if (!Number.isInteger(at) || !Number.isInteger(desktop) || desktop < 0 || desktop > 10
+          || at < now - root.launchGraceSeconds || at > now + 5) return
+      next[id] = { t: at, desktop: desktop }
+    } else return
     root.pendingLaunches = next
+    root.maybeLearn()
   }
 
   function hasRecentLaunch() {
@@ -1242,16 +1299,6 @@ Item {
     id: launchInfoDeadline
     interval: 5000
     onTriggered: if (launchInfoProc.running) launchInfoProc.running = false
-  }
-
-  FileView {
-    id: pendingFile
-    path: root.pendingPath
-    watchChanges: true
-    printErrors: false
-    onLoaded: root.loadPending(text())
-    onLoadFailed: root.pendingLaunches = Object.create(null)
-    onFileChanged: reload()
   }
 
   // ------------------------------------------------------- other processes
